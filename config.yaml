@@ -1,0 +1,105 @@
+# microllm config - LiteLLM-kompatibles Format
+# Reines Routing nach model_name, keine Format-Uebersetzung
+
+general_settings:
+  ocr_url: http://localhost:8019
+  chatlog_dir: /tmp/microllm-chatlog
+
+model_list:
+  # GPU: GLM-4.7-Flash FP8 (vLLM, Anthropic + OpenAI API)
+  - model_name: local
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: glm-4.7-flash
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  # Claude Code Standard-Modellnamen -> GPU
+  - model_name: haiku
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: sonnet
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: opus
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: claude-opus-4-5-20251101
+    litellm_params:
+      model: hosted_vllm/glm-4.7-flash
+      api_base: http://192.168.1.117:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  # CPU: GLM-4.7 Full Q6_K (llama.cpp, Anthropic + OpenAI API)
+  - model_name: host
+    litellm_params:
+      model: hosted_vllm/glm-4.7
+      api_base: http://192.168.1.117:8018/v1
+      api_key: dummy-key
+
+  - model_name: glm-4.7
+    litellm_params:
+      model: hosted_vllm/glm-4.7
+      api_base: http://192.168.1.117:8018/v1
+      api_key: dummy-key
+
+  - model_name: host2
+    litellm_params:
+      model: hosted_vllm/glm-4.7
+      api_base: http://192.168.1.117:8018/v1
+      api_key: dummy-key
+
+  # Spiegel 2 (RZ) via microllm
+  - model_name: rz-local
+    litellm_params:
+      model: local
+      api_base: http://10.249.0.99:8012/v1
+      api_key: dummy-key
+      max_model_len: 100000
+
+  - model_name: rz-host
+    litellm_params:
+      model: host
+      api_base: http://10.249.0.99:8012/v1
+      api_key: dummy-key

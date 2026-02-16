@@ -1,0 +1,36 @@
+#!/bin/bash
+# microllm - Minimaler LLM Routing Proxy
+# Drop-in Replacement fuer LiteLLM (Port 8012)
+# Reines Passthrough-Routing, keine Format-Uebersetzung
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${PORT:-8012}"
+CONTAINER_NAME="microllm"
+
+echo "=== microllm starten ==="
+echo "Config: $SCRIPT_DIR/config.yaml"
+echo "Port:   $PORT"
+echo ""
+
+# Image pruefen
+if ! podman image exists localhost/microllm; then
+    echo "Image nicht gefunden, baue es..."
+    bash "$SCRIPT_DIR/build"
+fi
+
+podman run -d \
+  --replace \
+  --name "$CONTAINER_NAME" \
+  --network host \
+  -v "$SCRIPT_DIR/config.yaml":/config/config.yaml:ro \
+  localhost/microllm \
+  /config/config.yaml "$PORT"
+
+echo ""
+echo "Container '$CONTAINER_NAME' gestartet."
+echo "Logs:    podman logs -f $CONTAINER_NAME"
+echo "Health:  http://localhost:$PORT/health"
+echo "Stats:   http://localhost:$PORT/stats"
+echo "Models:  http://localhost:$PORT/v1/models"
