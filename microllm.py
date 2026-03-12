@@ -65,12 +65,15 @@ class MicroLLM:
             if api_base.endswith("/v1"):
                 api_base = api_base[:-3]
             api_key = params.get("api_key", "dummy")
-            self.routes[name] = {
+            route = {
                 "api_base": api_base,
                 "model": model,
                 "api_key": api_key,
                 "max_model_len": int(params.get("max_model_len", 0)),
             }
+            if "chat_template_kwargs" in params:
+                route["chat_template_kwargs"] = params["chat_template_kwargs"]
+            self.routes[name] = route
 
         print(f"microllm: {len(self.routes)} routes loaded:")
         for name, route in self.routes.items():
@@ -108,6 +111,10 @@ class MicroLLM:
 
         # Replace model name with backend's expected name
         data["model"] = route["model"]
+
+        # Inject chat_template_kwargs if configured in route
+        if "chat_template_kwargs" in route and "chat_template_kwargs" not in data:
+            data["chat_template_kwargs"] = route["chat_template_kwargs"]
 
         body_out = json.dumps(data).encode()
 
@@ -482,12 +489,17 @@ class MicroLLM:
                                 mlen = m.get("max_model_len", 0)
                                 backend_model = m.get("backend_model", mid)
                                 if mid and mid == backend_model and mid not in self.routes and mid not in new_aliases:
-                                    new_aliases[mid] = {
+                                    alias_route = {
                                         "api_base": api_base,
                                         "model": mid,
                                         "api_key": api_key,
                                         "max_model_len": mlen,
                                     }
+                                    # Inherit chat_template_kwargs from parent route
+                                    parent = self.routes[route_names[0]]
+                                    if "chat_template_kwargs" in parent:
+                                        alias_route["chat_template_kwargs"] = parent["chat_template_kwargs"]
+                                    new_aliases[mid] = alias_route
                                     print(f"  + alias: {mid} (ctx:{mlen})", flush=True)
                     else:
                         print(f"  {api_base}: HTTP {resp.status}", flush=True)
