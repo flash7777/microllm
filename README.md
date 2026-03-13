@@ -15,6 +15,51 @@ Leichtgewichtiger Anthropic-API-Proxy mit Backend-Routing und OCR-Integration.
 ./start
 ```
 
+## Systemd-Service (rootless Podman)
+
+Einmalige Einrichtung:
+
+```bash
+# 1. System-User anlegen
+sudo useradd -r -s /usr/sbin/nologin -m -d /home/microllm microllm
+sudo loginctl enable-linger microllm
+
+# 2. subuid/subgid (rootless Podman)
+echo "microllm:200000:65536" | sudo tee -a /etc/subuid
+echo "microllm:200000:65536" | sudo tee -a /etc/subgid
+
+# 3. Storage-Config (ZFS-Hosts brauchen fuse-overlayfs)
+sudo -u microllm mkdir -p /home/microllm/.config/containers
+cat <<'CONF' | sudo tee /home/microllm/.config/containers/storage.conf
+[storage]
+driver = "overlay"
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+CONF
+
+# 4. Image + Config kopieren
+podman save localhost/microllm:latest -o /tmp/microllm-image.tar
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) podman load -i /tmp/microllm-image.tar
+sudo cp config.yaml /home/microllm/microllm/config.yaml
+sudo chown -R microllm:microllm /home/microllm/
+
+# 5. Service installieren
+sudo -u microllm mkdir -p /home/microllm/.config/systemd/user
+sudo cp microllm.service /home/microllm/.config/systemd/user/
+sudo chown -R microllm:microllm /home/microllm/.config
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) systemctl --user daemon-reload
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) systemctl --user enable --now microllm
+```
+
+Service-Management:
+
+```bash
+# Status / Logs / Restart
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) systemctl --user status microllm
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) journalctl --user -u microllm -f
+sudo -u microllm XDG_RUNTIME_DIR=/run/user/$(id -u microllm) systemctl --user restart microllm
+```
+
 ## Endpoints
 
 | Endpoint | Beschreibung |

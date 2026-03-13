@@ -1,0 +1,21 @@
+[Unit]
+Description=MicroLLM API Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/podman rm -f microllm
+ExecStart=/usr/bin/podman run \
+    --rm \
+    --name microllm \
+    --network host \
+    -v %h/microllm/config.yaml:/config/config.yaml:ro \
+    localhost/microllm /config/config.yaml 8012
+ExecStop=/usr/bin/podman stop -t 10 microllm
+Type=simple
+
+[Install]
+WantedBy=default.target
