@@ -1,0 +1,11 @@
+
+HOST=cloud.brandis.eu
+
+DOCKER_REGISTRY=docker.io
+DOCKER_NS=flash7777pods
+IMAGE=microllm
+SERVICES=.
+
+# Deploy
+CONTAINER_NAME=microllm
+PORT=8012

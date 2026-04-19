@@ -1,0 +1,24 @@
+# microllm config - ai.brandis.eu
+# Downstream GPU: vLLM auf 10.30.10.100:8011
+# Downstream CPU: llama.cpp auf 10.30.10.100:8018
+
+general_settings:
+  chatlog_dir: /tmp/microllm-chatlog
+
+model_list:
+  # GPU Backend (vLLM)
+  - model_name: local
+    litellm_params:
+      model: hosted_vllm/local
+      api_base: http://10.30.10.100:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+      chat_template_kwargs:
+        enable_thinking: false
+
+  # CPU Backend (llama.cpp)
+  - model_name: host
+    litellm_params:
+      model: hosted_vllm/host
+      api_base: http://10.30.10.100:8018/v1
+      api_key: dummy-key
