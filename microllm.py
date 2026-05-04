@@ -92,9 +92,21 @@ class MicroLLM:
                 status=400,
             )
 
-        # Intercept document blocks (PDF) -> OCR -> text
-        if self.ocr_url and "messages" in data:
+        # Intercept document blocks (PDF) -> OCR -> text, or strip if no OCR
+        if "messages" in data:
             data = await self._process_document_blocks(data)
+
+        # Strip server-side tools that vLLM doesn't understand (web_search)
+        if "tools" in data:
+            kept_tools = []
+            for tool in data["tools"]:
+                if tool.get("type", "").startswith("web_search"):
+                    pass  # Remove web_search server tool
+                else:
+                    kept_tools.append(tool)
+            data["tools"] = kept_tools
+            if not data["tools"]:
+                del data["tools"]
 
         model_name = data.get("model", "")
         route = self.routes.get(model_name)
@@ -323,7 +335,7 @@ class MicroLLM:
     # --- OCR Integration ---
 
     async def _process_document_blocks(self, data):
-        """Replace type:'document' blocks with type:'text' via OCR service."""
+        """Replace type:'document' blocks with type:'text' (via OCR or fallback)."""
         for msg in data.get("messages", []):
             content = msg.get("content")
             if not isinstance(content, list):
@@ -331,19 +343,27 @@ class MicroLLM:
             new_content = []
             for block in content:
                 if (isinstance(block, dict)
-                        and block.get("type") == "document"
-                        and block.get("source", {}).get("media_type") == "application/pdf"):
+                        and block.get("type") == "document"):
+                    media_type = block.get("source", {}).get("media_type", "")
                     pdf_b64 = block.get("source", {}).get("data", "")
-                    if pdf_b64:
+                    if pdf_b64 and self.ocr_url and "pdf" in media_type:
                         md = await self._call_ocr(pdf_b64)
                         new_content.append({
                             "type": "text",
                             "text": f"[PDF Document]\n\n{md}",
                         })
+                    elif pdf_b64 and not self.ocr_url:
+                        # No OCR available - insert placeholder
+                        import base64
+                        size_kb = len(pdf_b64) * 3 // 4 // 1024
+                        new_content.append({
+                            "type": "text",
+                            "text": f"[Document: {media_type}, {size_kb}KB - content not extractable without OCR service]",
+                        })
                     else:
                         new_content.append({
                             "type": "text",
-                            "text": "[PDF Document: empty or unreadable]",
+                            "text": "[Document: empty or unreadable]",
                         })
                 else:
                     new_content.append(block)
@@ -351,27 +371,29 @@ class MicroLLM:
         return data
 
     async def _call_ocr(self, pdf_base64):
-        """Call OCR service to convert PDF to markdown."""
+        """Extract text from PDF via Tika (PUT /tika/text with PDF body)."""
+        import base64
         try:
-            async with self.session.post(
-                f"{self.ocr_url}/ocr",
-                json={"pdf_base64": pdf_base64},
+            pdf_bytes = base64.b64decode(pdf_base64)
+            url = self.ocr_url.rstrip('/') + '/tika/text'
+            async with self.session.put(
+                url,
+                data=pdf_bytes,
+                headers={"Content-Type": "application/pdf", "Accept": "application/json"},
                 timeout=ClientTimeout(total=300),
             ) as resp:
                 if resp.status == 200:
                     result = await resp.json()
-                    md = result.get("markdown", "")
-                    pages = result.get("pages", 0)
-                    elapsed = result.get("elapsed_s", 0)
-                    print(f"  OCR: {pages} pages in {elapsed}s", flush=True)
-                    return md
+                    text = result.get("X-TIKA:content", "").strip()
+                    print(f"  Tika: extracted {len(text)} chars", flush=True)
+                    return text
                 else:
                     body = await resp.text()
-                    print(f"  OCR error {resp.status}: {body[:200]}", flush=True)
-                    return f"[OCR error: {resp.status}]"
+                    print(f"  Tika error {resp.status}: {body[:200]}", flush=True)
+                    return f"[Tika error: {resp.status}]"
         except Exception as e:
-            print(f"  OCR exception: {e}", flush=True)
-            return f"[OCR unavailable: {e}]"
+            print(f"  Tika exception: {e}", flush=True)
+            return f"[Tika unavailable: {e}]"
 
     # --- Chatlog ---
 
