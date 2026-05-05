@@ -116,16 +116,39 @@ class MicroLLM:
                     query = text[len(search_prefix):].strip()
                     results = await self._web_search(query)
                     search_text = self._format_search_results(results, query)
-                    # Return search results as a fake assistant response
-                    return web.json_response({
-                        "id": f"search-{int(time.time())}",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": search_text}],
-                        "model": data.get("model", "web-search"),
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    })
+                    msg_id = f"search-{int(time.time())}"
+                    model = data.get("model", "web-search")
+
+                    if data.get("stream"):
+                        # Return SSE stream response
+                        response = web.StreamResponse(
+                            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+                        )
+                        await response.prepare(request)
+                        # message_start
+                        await response.write(f'event: message_start\ndata: {json.dumps({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","content":[],"model":model,"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":0,"output_tokens":0}}})}\n\n'.encode())
+                        # content_block_start
+                        await response.write(f'event: content_block_start\ndata: {json.dumps({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})}\n\n'.encode())
+                        # content_block_delta with full text
+                        await response.write(f'event: content_block_delta\ndata: {json.dumps({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":search_text}})}\n\n'.encode())
+                        # content_block_stop
+                        await response.write(f'event: content_block_stop\ndata: {json.dumps({"type":"content_block_stop","index":0})}\n\n'.encode())
+                        # message_delta
+                        await response.write(f'event: message_delta\ndata: {json.dumps({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":None},"usage":{"output_tokens":len(search_text.split())}})}\n\n'.encode())
+                        # message_stop
+                        await response.write(f'event: message_stop\ndata: {json.dumps({"type":"message_stop"})}\n\n'.encode())
+                        await response.write_eof()
+                        return response
+                    else:
+                        return web.json_response({
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": search_text}],
+                            "model": model,
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        })
 
         # Intercept document blocks (PDF) -> OCR -> text, or strip if no OCR
         if "messages" in data:
