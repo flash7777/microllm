@@ -49,6 +49,11 @@ class MicroLLM:
             self.ocr_url = self.ocr_url.rstrip("/")
             print(f"microllm: OCR service at {self.ocr_url}")
 
+        self.web_search_url = settings.get("web_search_url", None)
+        if self.web_search_url:
+            self.web_search_url = self.web_search_url.rstrip("/")
+            print(f"microllm: web search at {self.web_search_url}")
+
         self.chatlog_dir = settings.get("chatlog_dir", None)
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
@@ -97,16 +102,35 @@ class MicroLLM:
             data = await self._process_document_blocks(data)
 
         # Strip server-side tools that vLLM doesn't understand (web_search)
+        # If web_search was requested AND we have a search engine configured,
+        # perform the search and inject results into context
         if "tools" in data:
+            has_web_search = False
             kept_tools = []
             for tool in data["tools"]:
                 if tool.get("type", "").startswith("web_search"):
-                    pass  # Remove web_search server tool
+                    has_web_search = True
                 else:
                     kept_tools.append(tool)
             data["tools"] = kept_tools
             if not data["tools"]:
                 del data["tools"]
+
+            # If web search was requested, search and inject results
+            if has_web_search and self.web_search_url:
+                query = self._extract_search_query(data)
+                if query:
+                    results = await self._web_search(query)
+                    if results:
+                        search_text = self._format_search_results(results, query)
+                        # Inject as system context
+                        system = data.get("system", "")
+                        if isinstance(system, list):
+                            system.append({"type": "text", "text": f"\n\n[Web Search Results]\n{search_text}"})
+                        elif isinstance(system, str):
+                            data["system"] = system + f"\n\n[Web Search Results]\n{search_text}"
+                        else:
+                            data["system"] = f"[Web Search Results]\n{search_text}"
 
         model_name = data.get("model", "")
         route = self.routes.get(model_name)
@@ -394,6 +418,103 @@ class MicroLLM:
         except Exception as e:
             print(f"  Tika exception: {e}", flush=True)
             return f"[Tika unavailable: {e}]"
+
+    def _extract_search_query(self, data):
+        """Extract a search query from the last user message."""
+        msgs = data.get("messages", [])
+        for m in reversed(msgs):
+            if m.get("role") != "user":
+                continue
+            content = m.get("content", "")
+            if isinstance(content, str):
+                return content[:200]
+            elif isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text and len(text) < 500:
+                            return text
+            break
+        return None
+
+    # --- Web Search ---
+
+    async def _web_search(self, query, max_results=5):
+        """Perform web search via configured search engine (SearXNG or DuckDuckGo)."""
+        if not self.web_search_url:
+            return []
+
+        try:
+            if self.web_search_url.lower() == "duckduckgo":
+                return await self._search_duckduckgo(query, max_results)
+            else:
+                return await self._search_searxng(query, max_results)
+        except Exception as e:
+            print(f"  WebSearch error: {e}", flush=True)
+            return [{"title": "Search error", "url": "", "snippet": str(e)}]
+
+    async def _search_searxng(self, query, max_results):
+        """Search via SearXNG JSON API."""
+        params = f"?q={query}&format=json&engines=google,bing,duckduckgo&max_results={max_results}"
+        url = f"{self.web_search_url}/search{params}"
+        async with self.session.get(url, timeout=ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                results = []
+                for r in data.get("results", [])[:max_results]:
+                    results.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("url", ""),
+                        "snippet": r.get("content", ""),
+                    })
+                print(f"  WebSearch: {len(results)} results for '{query[:50]}'", flush=True)
+                return results
+            else:
+                print(f"  SearXNG error {resp.status}", flush=True)
+                return []
+
+    async def _search_duckduckgo(self, query, max_results):
+        """Search via DuckDuckGo HTML (no API key needed)."""
+        from urllib.parse import quote_plus
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        async with self.session.get(url, headers=headers, timeout=ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            html = await resp.text()
+            # Parse results from HTML
+            results = []
+            import re
+            # DuckDuckGo HTML results are in <a class="result__a" href="...">title</a>
+            # and <a class="result__snippet">snippet</a>
+            links = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html)
+            snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+            for i, (href, title) in enumerate(links[:max_results]):
+                snippet = snippets[i].strip() if i < len(snippets) else ""
+                # Clean HTML tags from snippet/title
+                title = re.sub(r'<[^>]+>', '', title).strip()
+                snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+                # DuckDuckGo wraps URLs in redirect
+                if "uddg=" in href:
+                    from urllib.parse import unquote, parse_qs, urlparse
+                    parsed = urlparse(href)
+                    actual_url = parse_qs(parsed.query).get("uddg", [href])[0]
+                    href = unquote(actual_url)
+                results.append({"title": title, "url": href, "snippet": snippet})
+            print(f"  WebSearch(DDG): {len(results)} results for '{query[:50]}'", flush=True)
+            return results
+
+    def _format_search_results(self, results, query):
+        """Format search results as text for the model."""
+        if not results:
+            return f"No web search results found for: {query}"
+        lines = [f"Web search results for: \"{query}\"\n"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. [{r['title']}]({r['url']})")
+            if r['snippet']:
+                lines.append(f"   {r['snippet']}")
+            lines.append("")
+        return "\n".join(lines)
 
     # --- Chatlog ---
 

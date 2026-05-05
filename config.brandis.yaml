@@ -4,6 +4,7 @@
 
 general_settings:
   chatlog_dir: /tmp/microllm-chatlog
+  web_search_url: duckduckgo
 
 model_list:
   # GPU Backend (vLLM)
