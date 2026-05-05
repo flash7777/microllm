@@ -97,6 +97,36 @@ class MicroLLM:
                 status=400,
             )
 
+        # Intercept "Perform a web search" requests from Claude Code
+        if self.web_search_url and "messages" in data:
+            msgs = data.get("messages", [])
+            if len(msgs) == 1 and msgs[0].get("role") == "user":
+                content = msgs[0].get("content", "")
+                search_prefix = "Perform a web search for the query:"
+                # Handle both string and list content
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    for block in content:
+                        if block.get("type") == "text":
+                            text = block.get("text", "")
+                            break
+                if text.startswith(search_prefix):
+                    query = text[len(search_prefix):].strip()
+                    results = await self._web_search(query)
+                    search_text = self._format_search_results(results, query)
+                    # Return search results as a fake assistant response
+                    return web.json_response({
+                        "id": f"search-{int(time.time())}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": search_text}],
+                        "model": data.get("model", "web-search"),
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    })
+
         # Intercept document blocks (PDF) -> OCR -> text, or strip if no OCR
         if "messages" in data:
             data = await self._process_document_blocks(data)
