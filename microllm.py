@@ -23,9 +23,13 @@ class MicroLLM:
     HARD_TIMEOUT = 600          # Hard timeout after 10 minutes
     DISCOVERY_COOLDOWN = 600    # Re-discover backends at most every 10 minutes
 
+    HEALTH_CHECK_INTERVAL = 30     # Check unhealthy backends every 30s
+    HEALTH_FAIL_THRESHOLD = 3      # Mark unhealthy after N consecutive failures
+
     def __init__(self, config_path, port=8012):
         self.port = port
-        self.routes = {}        # model_name -> {api_base, model, api_key}
+        self.routes = {}        # model_name -> [backend, ...]  (list for round-robin)
+        self.rr_index = defaultdict(int)  # model_name -> next backend index
         self.ocr_url = None     # OCR service URL (e.g. http://localhost:8019)
         self.stats = defaultdict(lambda: {
             "requests": 0, "tokens_in": 0, "tokens_out": 0,
@@ -78,11 +82,50 @@ class MicroLLM:
             }
             if "chat_template_kwargs" in params:
                 route["chat_template_kwargs"] = params["chat_template_kwargs"]
-            self.routes[name] = route
+            route["healthy"] = True
+            route["fail_count"] = 0
+            self.routes.setdefault(name, []).append(route)
 
         print(f"microllm: {len(self.routes)} routes loaded:")
-        for name, route in self.routes.items():
-            print(f"  {name:20s} -> {route['api_base']}  (model: {route['model']})")
+        for name, backends in self.routes.items():
+            if len(backends) == 1:
+                print(f"  {name:20s} -> {backends[0]['api_base']}  (model: {backends[0]['model']})")
+            else:
+                print(f"  {name:20s} -> {len(backends)} backends (round-robin):")
+                for b in backends:
+                    print(f"    - {b['api_base']}  (model: {b['model']})")
+
+    def pick_backend(self, model_name):
+        """Pick next healthy backend for model (round-robin with failover)."""
+        backends = self.routes.get(model_name)
+        if not backends:
+            return None
+        n = len(backends)
+        start = self.rr_index[model_name] % n
+        for i in range(n):
+            idx = (start + i) % n
+            if backends[idx]["healthy"]:
+                self.rr_index[model_name] = idx + 1
+                return backends[idx]
+        # All unhealthy — try first anyway (let it fail or recover)
+        self.rr_index[model_name] = start + 1
+        return backends[start]
+
+    def mark_failed(self, model_name, backend):
+        """Mark a backend as failed. After threshold, mark unhealthy."""
+        backend["fail_count"] += 1
+        if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD:
+            if backend["healthy"]:
+                backend["healthy"] = False
+                print(f"  {model_name}: backend {backend['api_base']} marked UNHEALTHY "
+                      f"(after {backend['fail_count']} failures)", flush=True)
+
+    def mark_success(self, model_name, backend):
+        """Mark a backend as successful. Reset fail count, restore health."""
+        if not backend["healthy"]:
+            print(f"  {model_name}: backend {backend['api_base']} recovered", flush=True)
+        backend["fail_count"] = 0
+        backend["healthy"] = True
 
     # --- Request handlers ---
 
@@ -186,8 +229,7 @@ class MicroLLM:
                             data["system"] = f"[Web Search Results]\n{search_text}"
 
         model_name = data.get("model", "")
-        route = self.routes.get(model_name)
-        if not route:
+        if model_name not in self.routes:
             return web.json_response(
                 {
                     "error": {
@@ -198,53 +240,67 @@ class MicroLLM:
                 status=404,
             )
 
-        # Replace model name with backend's expected name
-        data["model"] = route["model"]
-
-        # Inject chat_template_kwargs if configured in route
-        if "chat_template_kwargs" in route and "chat_template_kwargs" not in data:
-            data["chat_template_kwargs"] = route["chat_template_kwargs"]
-
-        body_out = json.dumps(data).encode()
-
-        # Build backend URL (preserve full path + query string)
-        path = request.path
-        url = f"{route['api_base']}{path}"
-        qs = request.query_string
-        if qs:
-            url += f"?{qs}"
-
-        # Forward headers, skip hop-by-hop
-        headers = {}
-        for key, val in request.headers.items():
-            if key.lower() not in ("host", "content-length", "transfer-encoding"):
-                headers[key] = val
-        headers["Content-Length"] = str(len(body_out))
-
         is_stream = data.get("stream", False)
         self.stats[model_name]["requests"] += 1
         self.chatlog_seq += 1
         req_seq = self.chatlog_seq
-        t0 = time.monotonic()
 
-        # Chatlog: write request
-        if self.chatlog_dir:
-            self._chatlog_write(req_seq, "req", data, model_name)
+        # Try backends with failover
+        backends = self.routes[model_name]
+        max_tries = len(backends)
+        last_error = None
 
-        try:
-            async with self.session.post(url, data=body_out, headers=headers) as resp:
-                content_type = resp.headers.get("content-type", "")
+        for attempt in range(max_tries):
+            route = self.pick_backend(model_name)
+            if not route:
+                break
 
-                if is_stream or "text/event-stream" in content_type:
-                    return await self._stream_response(request, resp, model_name, t0, req_seq)
-                else:
-                    return await self._buffered_response(resp, model_name, t0, req_seq)
-        except Exception as e:
-            self.stats[model_name]["errors"] += 1
-            return web.json_response(
-                {"error": {"message": f"Backend error: {e}", "type": "proxy_error"}},
-                status=502,
-            )
+            # Prepare request for this backend
+            send_data = dict(data)
+            send_data["model"] = route["model"]
+            if "chat_template_kwargs" in route and "chat_template_kwargs" not in send_data:
+                send_data["chat_template_kwargs"] = route["chat_template_kwargs"]
+
+            body_out = json.dumps(send_data).encode()
+
+            path = request.path
+            url = f"{route['api_base']}{path}"
+            qs = request.query_string
+            if qs:
+                url += f"?{qs}"
+
+            headers = {}
+            for key, val in request.headers.items():
+                if key.lower() not in ("host", "content-length", "transfer-encoding"):
+                    headers[key] = val
+            headers["Content-Length"] = str(len(body_out))
+
+            t0 = time.monotonic()
+
+            if self.chatlog_dir and attempt == 0:
+                self._chatlog_write(req_seq, "req", send_data, model_name)
+
+            try:
+                async with self.session.post(url, data=body_out, headers=headers) as resp:
+                    content_type = resp.headers.get("content-type", "")
+                    self.mark_success(model_name, route)
+
+                    if is_stream or "text/event-stream" in content_type:
+                        return await self._stream_response(request, resp, model_name, t0, req_seq)
+                    else:
+                        return await self._buffered_response(resp, model_name, t0, req_seq)
+            except Exception as e:
+                self.mark_failed(model_name, route)
+                last_error = e
+                if max_tries > 1:
+                    print(f"  {model_name}: backend {route['api_base']} failed ({e}), "
+                          f"trying next ({attempt+1}/{max_tries})", flush=True)
+
+        self.stats[model_name]["errors"] += 1
+        return web.json_response(
+            {"error": {"message": f"All backends failed: {last_error}", "type": "proxy_error"}},
+            status=502,
+        )
 
     async def _stream_response(self, request, resp, model_name, t0, req_seq=0):
         """Forward SSE stream from backend to client with keep-alive heartbeats."""
@@ -378,27 +434,32 @@ class MicroLLM:
         if now - self.last_discovery > self.DISCOVERY_COOLDOWN:
             await self.discover_backends()
 
-        models = [
-            {
+        models = []
+        for name, backends in self.routes.items():
+            healthy = [b for b in backends if b["healthy"]]
+            models.append({
                 "id": name,
                 "object": "model",
-                "backend": route["api_base"],
-                "backend_model": route["model"],
-            }
-            for name, route in self.routes.items()
-        ]
+                "backends": len(backends),
+                "healthy": len(healthy),
+                "backend": backends[0]["api_base"],
+                "backend_model": backends[0]["model"],
+            })
         return web.json_response({"object": "list", "data": models})
 
     async def handle_stats(self, request):
         uptime = time.time() - self.start_time
         models = {}
-        for name in self.routes:
+        for name, backends in self.routes.items():
             s = dict(self.stats[name])
-            # Compute average tok/s
             if s["tokens_out"] > 0 and s["total_gen_s"] > 0:
                 s["avg_tok_s"] = round(s["tokens_out"] / s["total_gen_s"], 1)
             else:
                 s["avg_tok_s"] = 0
+            s["backends"] = [
+                {"api_base": b["api_base"], "healthy": b["healthy"], "fail_count": b["fail_count"]}
+                for b in backends
+            ]
             models[name] = s
         return web.json_response(
             {
@@ -644,67 +705,94 @@ class MicroLLM:
     # --- Server ---
 
     async def discover_backends(self):
-        """Query backends to discover actual model names and create aliases."""
+        """Query backends to discover actual model names and update health."""
         self.last_discovery = time.monotonic()
         print("microllm: discovering backends...", flush=True)
 
-        # Group routes by api_base to avoid duplicate queries
-        base_to_routes = defaultdict(list)
-        for name, route in self.routes.items():
-            base_to_routes[route["api_base"]].append(name)
+        # Collect all unique api_bases across all backends
+        seen_bases = set()
+        base_info = {}  # api_base -> {actual_model, max_model_len, api_key}
 
-        new_aliases = {}  # model_name -> route_config (to add after iteration)
+        for name, backends in self.routes.items():
+            for backend in backends:
+                base = backend["api_base"]
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                try:
+                    url = f"{base}/v1/models"
+                    async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            models = data.get("data", [])
+                            if models:
+                                base_info[base] = {
+                                    "actual_model": models[0].get("id", ""),
+                                    "max_model_len": models[0].get("max_model_len", 0),
+                                    "models": models,
+                                }
+                                backend["healthy"] = True
+                                backend["fail_count"] = 0
+                                print(f"  {base}: {models[0].get('id','')} (ctx:{models[0].get('max_model_len',0)})", flush=True)
+                        else:
+                            print(f"  {base}: HTTP {resp.status}", flush=True)
+                            backend["healthy"] = False
+                except Exception as e:
+                    print(f"  {base}: {type(e).__name__} - {e}", flush=True)
+                    backend["healthy"] = False
 
-        for api_base, route_names in base_to_routes.items():
-            try:
-                url = f"{api_base}/v1/models"
-                async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        models = data.get("data", [])
-                        if models:
-                            # Use first model as the actual backend model for configured routes
-                            actual_model = models[0].get("id", "")
-                            max_model_len = models[0].get("max_model_len", 0)
-                            if actual_model:
-                                for route_name in route_names:
-                                    old_model = self.routes[route_name]["model"]
-                                    self.routes[route_name]["model"] = actual_model
-                                    if max_model_len:
-                                        self.routes[route_name]["max_model_len"] = max_model_len
-                                    if old_model != actual_model:
-                                        print(f"  {route_name}: {old_model} -> {actual_model} (ctx:{max_model_len})", flush=True)
-                                    else:
-                                        print(f"  {route_name}: {actual_model} (ctx:{max_model_len})", flush=True)
+        # Update backend model names from discovery
+        for name, backends in self.routes.items():
+            for backend in backends:
+                info = base_info.get(backend["api_base"])
+                if info and info["actual_model"]:
+                    backend["model"] = info["actual_model"]
+                    if info["max_model_len"]:
+                        backend["max_model_len"] = info["max_model_len"]
 
-                            # Add discovered real model names as aliases (cascade transparency)
-                            # Only import where id == backend_model (skip routing aliases)
-                            api_key = self.routes[route_names[0]]["api_key"]
-                            for m in models:
-                                mid = m.get("id", "")
-                                mlen = m.get("max_model_len", 0)
-                                backend_model = m.get("backend_model", mid)
-                                if mid and mid == backend_model and mid not in self.routes and mid not in new_aliases:
-                                    alias_route = {
-                                        "api_base": api_base,
-                                        "model": mid,
-                                        "api_key": api_key,
-                                        "max_model_len": mlen,
-                                    }
-                                    # Inherit chat_template_kwargs from parent route
-                                    parent = self.routes[route_names[0]]
-                                    if "chat_template_kwargs" in parent:
-                                        alias_route["chat_template_kwargs"] = parent["chat_template_kwargs"]
-                                    new_aliases[mid] = alias_route
-                                    print(f"  + alias: {mid} (ctx:{mlen})", flush=True)
-                    else:
-                        print(f"  {api_base}: HTTP {resp.status}", flush=True)
-            except Exception as e:
-                print(f"  {api_base}: {type(e).__name__} - {e}", flush=True)
+        # Add discovered model names as single-backend aliases
+        new_aliases = {}
+        for base, info in base_info.items():
+            api_key = "dummy"
+            # Find api_key from any backend using this base
+            for backends in self.routes.values():
+                for b in backends:
+                    if b["api_base"] == base:
+                        api_key = b["api_key"]
+                        break
+            for m in info.get("models", []):
+                mid = m.get("id", "")
+                if mid and mid not in self.routes and mid not in new_aliases:
+                    new_aliases[mid] = [{
+                        "api_base": base,
+                        "model": mid,
+                        "api_key": api_key,
+                        "max_model_len": m.get("max_model_len", 0),
+                        "healthy": True,
+                        "fail_count": 0,
+                    }]
+                    print(f"  + alias: {mid}", flush=True)
 
-        # Add discovered aliases
         self.routes.update(new_aliases)
         print(flush=True)
+
+    async def _health_check_loop(self):
+        """Periodically check unhealthy backends and restore them."""
+        while True:
+            await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
+            for name, backends in self.routes.items():
+                for backend in backends:
+                    if backend["healthy"]:
+                        continue
+                    try:
+                        url = f"{backend['api_base']}/v1/models"
+                        async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                backend["healthy"] = True
+                                backend["fail_count"] = 0
+                                print(f"  {name}: backend {backend['api_base']} recovered", flush=True)
+                    except Exception:
+                        pass  # Still unhealthy
 
     async def run(self):
         connector = TCPConnector(
@@ -717,6 +805,9 @@ class MicroLLM:
 
         # Auto-discover backend models
         await self.discover_backends()
+
+        # Background health checker for unhealthy backends
+        asyncio.create_task(self._health_check_loop())
 
         app = web.Application(client_max_size=100 * 1024 * 1024)  # 100 MB
         app.router.add_get("/health", self.handle_health)
