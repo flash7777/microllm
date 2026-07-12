@@ -29,6 +29,7 @@ class MicroLLM:
     def __init__(self, config_path, port=8012):
         self.port = port
         self.routes = {}        # model_name -> [backend, ...]  (list for round-robin)
+        self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
         self.ocr_url = None     # OCR service URL (e.g. http://localhost:8019)
         self.stats = defaultdict(lambda: {
@@ -86,6 +87,13 @@ class MicroLLM:
             route["fail_count"] = 0
             self.routes.setdefault(name, []).append(route)
 
+        # Load service routes (generic HTTP proxy with round-robin)
+        for entry in config.get("service_list", []):
+            name = entry["service_name"]
+            api_base = entry.get("api_base", "").rstrip("/")
+            svc = {"api_base": api_base, "healthy": True, "fail_count": 0}
+            self.services.setdefault(name, []).append(svc)
+
         print(f"microllm: {len(self.routes)} routes loaded:")
         for name, backends in self.routes.items():
             if len(backends) == 1:
@@ -94,6 +102,15 @@ class MicroLLM:
                 print(f"  {name:20s} -> {len(backends)} backends (round-robin):")
                 for b in backends:
                     print(f"    - {b['api_base']}  (model: {b['model']})")
+        if self.services:
+            print(f"microllm: {len(self.services)} services loaded:")
+            for name, backends in self.services.items():
+                if len(backends) == 1:
+                    print(f"  {name:20s} -> {backends[0]['api_base']}")
+                else:
+                    print(f"  {name:20s} -> {len(backends)} backends (round-robin):")
+                    for b in backends:
+                        print(f"    - {b['api_base']}")
 
     def pick_backend(self, model_name):
         """Pick next healthy backend for model (round-robin with failover)."""
@@ -423,6 +440,89 @@ class MicroLLM:
             body=resp_body,
             status=resp.status,
             content_type=ct,
+        )
+
+    # --- Service proxy (generic HTTP, multipart, round-robin) ---
+
+    def pick_service_backend(self, service_name):
+        """Pick next healthy backend for a service (round-robin)."""
+        backends = self.services.get(service_name)
+        if not backends:
+            return None
+        n = len(backends)
+        key = f"svc:{service_name}"
+        start = self.rr_index[key] % n
+        for i in range(n):
+            idx = (start + i) % n
+            if backends[idx]["healthy"]:
+                self.rr_index[key] = idx + 1
+                return backends[idx]
+        self.rr_index[key] = start + 1
+        return backends[start]
+
+    async def handle_service(self, request):
+        """Proxy any request to a named service with round-robin + failover."""
+        service_name = request.match_info["service"]
+        sub_path = request.match_info.get("path", "")
+
+        if service_name not in self.services:
+            return web.json_response(
+                {"error": f"Unknown service: '{service_name}'. Available: {list(self.services.keys())}"},
+                status=404,
+            )
+
+        body = await request.read()
+        backends = self.services[service_name]
+        max_tries = len(backends)
+        last_error = None
+        svc_key = f"svc:{service_name}"
+        self.stats[svc_key]["requests"] += 1
+
+        for attempt in range(max_tries):
+            backend = self.pick_service_backend(service_name)
+            if not backend:
+                break
+
+            url = f"{backend['api_base']}/{sub_path}" if sub_path else backend["api_base"]
+            qs = request.query_string
+            if qs:
+                url += f"?{qs}"
+
+            headers = {}
+            for key, val in request.headers.items():
+                if key.lower() not in ("host", "transfer-encoding"):
+                    headers[key] = val
+
+            t0 = time.monotonic()
+            try:
+                async with self.session.request(
+                    request.method, url, data=body, headers=headers,
+                    timeout=ClientTimeout(total=600),
+                ) as resp:
+                    resp_body = await resp.read()
+                    elapsed = time.monotonic() - t0
+                    self.stats[svc_key]["total_gen_s"] += elapsed
+                    backend["fail_count"] = 0
+                    if not backend["healthy"]:
+                        backend["healthy"] = True
+                        print(f"  svc:{service_name}: backend {backend['api_base']} recovered", flush=True)
+                    ct = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+                    print(f"  svc:{service_name:15s}  {resp.status}  {elapsed:5.1f}s  "
+                          f"{backend['api_base']}/{sub_path}", flush=True)
+                    return web.Response(body=resp_body, status=resp.status, content_type=ct)
+            except Exception as e:
+                backend["fail_count"] += 1
+                if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend["healthy"]:
+                    backend["healthy"] = False
+                    print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY", flush=True)
+                last_error = e
+                if max_tries > 1:
+                    print(f"  svc:{service_name}: backend {backend['api_base']} failed ({e}), "
+                          f"trying next ({attempt+1}/{max_tries})", flush=True)
+
+        self.stats[svc_key]["errors"] += 1
+        return web.json_response(
+            {"error": f"All backends failed: {last_error}"}, status=502,
         )
 
     async def handle_health(self, request):
@@ -813,6 +913,7 @@ class MicroLLM:
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/stats", self.handle_stats)
+        app.router.add_route("*", "/svc/{service}/{path:.*}", self.handle_service)
         app.router.add_route("*", "/{path:.*}", self.handle_proxy)
 
         runner = web.AppRunner(app, access_log=None)

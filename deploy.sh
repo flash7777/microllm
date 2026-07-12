@@ -50,6 +50,8 @@ load_config() {
                 IMAGE) IMAGE_NAME="${value}" ;;
                 CONTAINER_NAME) CONTAINER_NAME="${value}" ;;
                 PORT) PORT="${value}" ;;
+                REPO) REPO="${value}" ;;
+                GIT_BASE) GIT_BASE="${value}" ;;
             esac
         done < "${DIST_FILE}"
     else
@@ -59,7 +61,13 @@ load_config() {
 
     REMOTE_HOST="root@${HOST}"
     REMOTE_CONFIG_DIR="/data/microllm"
-    IMAGE="${DOCKER_REGISTRY}/${DOCKER_NAMESPACE}/${IMAGE_NAME}"
+    # Support both old (Docker Hub) and new (Codeberg via job.py) image paths
+    if [[ -n "${GIT_BASE:-}" && -n "${REPO:-}" ]]; then
+        # Codeberg: https://codeberg.org/Gemini-Foundation -> codeberg.org/Gemini-Foundation/microllm
+        IMAGE="$(echo "${GIT_BASE}" | sed 's|https://||')/${REPO}"
+    else
+        IMAGE="${DOCKER_REGISTRY}/${DOCKER_NAMESPACE}/${IMAGE_NAME}"
+    fi
 }
 
 #=============================================================================
