@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-IMAGE="${IMAGE:-codeberg.org/Gemini-Foundation/microllm}"
+IMAGE="${IMAGE:-codeberg.org/gemini-foundation/microllm}"
+IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
 TAG="${TAG:-$(date +%Y%m%d-%H%M)}"
 
 if command -v buildah &>/dev/null; then
