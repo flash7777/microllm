@@ -64,7 +64,7 @@ load_config() {
     # Support both old (Docker Hub) and new (Codeberg via job.py) image paths
     if [[ -n "${GIT_BASE:-}" && -n "${REPO:-}" ]]; then
         # Codeberg: https://codeberg.org/Gemini-Foundation -> codeberg.org/Gemini-Foundation/microllm
-        IMAGE="$(echo "${GIT_BASE}" | sed 's|https://||')/${REPO}"
+        IMAGE="$(echo "${GIT_BASE}" | sed 's|https://||' | tr '[:upper:]' '[:lower:]')/${REPO}"
     else
         IMAGE="${DOCKER_REGISTRY}/${DOCKER_NAMESPACE}/${IMAGE_NAME}"
     fi
