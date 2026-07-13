@@ -152,6 +152,11 @@ class MicroLLM:
         try:
             data = json.loads(body_raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
+            # Non-JSON request (e.g. multipart/form-data for audio uploads)
+            # Extract model name from form data and forward as-is
+            content_type = request.headers.get("content-type", "")
+            if "multipart" in content_type or "/audio/" in request.path:
+                return await self._passthrough_proxy(request, body_raw)
             return web.json_response(
                 {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
                 status=400,
@@ -441,6 +446,75 @@ class MicroLLM:
             status=resp.status,
             content_type=ct,
         )
+
+    # --- Passthrough proxy (multipart/audio, no JSON parsing) ---
+
+    async def _passthrough_proxy(self, request, body_raw):
+        """Forward non-JSON requests (multipart audio uploads) to backend by model name from form data."""
+        # Try to extract model name from multipart form data
+        model_name = None
+        try:
+            reader = await request.multipart()
+            # Re-read body since multipart consumed it
+            body_raw = await request.read()
+        except Exception:
+            pass
+
+        # Parse model from form fields in raw body (simple search)
+        content_type = request.headers.get("content-type", "")
+        if not model_name:
+            # Try form data field "model" from the raw multipart body
+            import re
+            match = re.search(rb'name="model"\r\n\r\n([^\r\n]+)', body_raw)
+            if match:
+                model_name = match.group(1).decode("utf-8", errors="replace").strip()
+
+        if not model_name:
+            # Fallback: try first route that handles audio
+            for name in ("llm-stt", "whisper-large-v3"):
+                if name in self.routes:
+                    model_name = name
+                    break
+
+        if not model_name or model_name not in self.routes:
+            return web.json_response(
+                {"error": f"Cannot determine model for multipart request. Available: {list(self.routes.keys())}"},
+                status=400,
+            )
+
+        route = self.pick_backend(model_name)
+        if not route:
+            return web.json_response({"error": f"No healthy backend for {model_name}"}, status=502)
+
+        url = f"{route['api_base']}{request.path}"
+        qs = request.query_string
+        if qs:
+            url += f"?{qs}"
+
+        headers = {}
+        for key, val in request.headers.items():
+            if key.lower() not in ("host", "transfer-encoding"):
+                headers[key] = val
+
+        self.stats[model_name]["requests"] += 1
+        t0 = time.monotonic()
+
+        try:
+            async with self.session.request(
+                request.method, url, data=body_raw, headers=headers,
+                timeout=ClientTimeout(total=600),
+            ) as resp:
+                resp_body = await resp.read()
+                elapsed = time.monotonic() - t0
+                self.mark_success(model_name, route)
+                self.stats[model_name]["total_gen_s"] += elapsed
+                ct = resp.headers.get("content-type", "application/json").split(";")[0].strip()
+                self._log(model_name, f"pt:{resp.status}", elapsed)
+                return web.Response(body=resp_body, status=resp.status, content_type=ct)
+        except Exception as e:
+            self.mark_failed(model_name, route)
+            self.stats[model_name]["errors"] += 1
+            return web.json_response({"error": f"Backend failed: {e}"}, status=502)
 
     # --- Service proxy (generic HTTP, multipart, round-robin) ---
 
