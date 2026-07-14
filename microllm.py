@@ -983,7 +983,7 @@ class MicroLLM:
         # Background health checker for unhealthy backends
         asyncio.create_task(self._health_check_loop())
 
-        app = web.Application(client_max_size=100 * 1024 * 1024)  # 100 MB
+        app = web.Application(client_max_size=500 * 1024 * 1024)  # 500 MB
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/stats", self.handle_stats)
