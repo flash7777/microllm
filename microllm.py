@@ -583,6 +583,14 @@ class MicroLLM:
                     ct = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
                     print(f"  svc:{service_name:15s}  {resp.status}  {elapsed:5.1f}s  "
                           f"{backend['api_base']}/{sub_path}", flush=True)
+                    if resp.status >= 500 and attempt + 1 < max_tries:
+                        backend["fail_count"] += 1
+                        if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend["healthy"]:
+                            backend["healthy"] = False
+                            print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY", flush=True)
+                        print(f"  svc:{service_name}: backend {backend['api_base']} returned {resp.status}, "
+                              f"trying next ({attempt+1}/{max_tries})", flush=True)
+                        continue
                     return web.Response(body=resp_body, status=resp.status, content_type=ct)
             except Exception as e:
                 backend["fail_count"] += 1
