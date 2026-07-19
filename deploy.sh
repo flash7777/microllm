@@ -88,8 +88,13 @@ cmd_pull() {
 cmd_config() {
     log_step "Syncing Config"
     ssh "${REMOTE_HOST}" "mkdir -p ${REMOTE_CONFIG_DIR}"
+    if ssh "${REMOTE_HOST}" "test -f ${REMOTE_CONFIG_DIR}/config.yaml"; then
+        log_warn "Remote config exists — skipping (each host has its own config)."
+        log_warn "To force-overwrite: scp config.yaml ${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/config.yaml"
+        return
+    fi
     scp "${SCRIPT_DIR}/config.yaml" "${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/config.yaml"
-    log_info "config.yaml synced to ${REMOTE_CONFIG_DIR}/"
+    log_info "Initial config.yaml deployed to ${REMOTE_CONFIG_DIR}/"
 }
 
 cmd_start() {
