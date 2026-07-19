@@ -86,30 +86,25 @@ cmd_pull() {
 }
 
 cmd_config() {
-    log_step "Syncing Config"
+    log_step "Syncing Start Script"
     ssh "${REMOTE_HOST}" "mkdir -p ${REMOTE_CONFIG_DIR}"
-    if ssh "${REMOTE_HOST}" "test -f ${REMOTE_CONFIG_DIR}/config.yaml"; then
-        log_warn "Remote config exists — skipping (each host has its own config)."
-        log_warn "To force-overwrite: scp config.yaml ${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/config.yaml"
-        return
+    # Start script always synced (no host-specific state)
+    scp "${SCRIPT_DIR}/start.brandis" "${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/start.sh"
+    ssh "${REMOTE_HOST}" "chmod +x ${REMOTE_CONFIG_DIR}/start.sh"
+    log_info "start.sh synced to ${REMOTE_CONFIG_DIR}/"
+    # Config only if missing (each host has its own)
+    if ! ssh "${REMOTE_HOST}" "test -f ${REMOTE_CONFIG_DIR}/config.yaml"; then
+        scp "${SCRIPT_DIR}/config.brandis.yaml" "${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/config.yaml"
+        log_info "Initial config.yaml deployed"
+    else
+        log_info "Remote config exists — not overwriting"
     fi
-    scp "${SCRIPT_DIR}/config.yaml" "${REMOTE_HOST}:${REMOTE_CONFIG_DIR}/config.yaml"
-    log_info "Initial config.yaml deployed to ${REMOTE_CONFIG_DIR}/"
 }
 
 cmd_start() {
     log_step "Starting microllm"
-    ssh "${REMOTE_HOST}" "podman run -d \
-        --replace \
-        --name ${CONTAINER_NAME} \
-        --network opencloud_full_opencloud-net \
-        -p ${PORT}:${PORT} \
-        --restart always \
-        -v ${REMOTE_CONFIG_DIR}/config.yaml:/config/config.yaml:ro \
-        ${IMAGE}:latest \
-        /config/config.yaml ${PORT}"
-    sleep 1
-    log_info "Container started on port ${PORT}"
+    ssh "${REMOTE_HOST}" "IMAGE=${IMAGE}:latest bash ${REMOTE_CONFIG_DIR}/start.sh"
+    sleep 2
     ssh "${REMOTE_HOST}" "podman logs ${CONTAINER_NAME} 2>&1 | tail -5"
 }
 

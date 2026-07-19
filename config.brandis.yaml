@@ -1,0 +1,125 @@
+# microllm config — cloud.brandis.eu
+# DGX: 10.30.254.81 | PGX: 10.30.254.82
+# RTX: 10.30.10.111 | RZ: 10.249.0.99
+
+general_settings:
+  chatlog_dir: /tmp/microllm-chatlog
+  web_search_url: duckduckgo
+
+model_list:
+  # ── LLM: Qwen3.5-122B (RTX single) ──
+  - model_name: local
+    litellm_params:
+      model: hosted_vllm/qwen3.5-122b
+      api_base: http://10.30.10.111:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+      chat_template_kwargs: { enable_thinking: false }
+
+  - model_name: glm-4.7-flash
+    litellm_params:
+      model: hosted_vllm/qwen3.5-122b
+      api_base: http://10.30.10.111:8011/v1
+      api_key: dummy-key
+      max_model_len: 100000
+      chat_template_kwargs: { enable_thinking: false }
+
+  # Claude aliases -> RTX
+  - model_name: haiku
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: sonnet
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: opus
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: claude-sonnet-4-20250514
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: claude-opus-4-20250514
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: claude-opus-4-5-20251101
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+
+  # Analyst/Research/Creative aliases (RTX single)
+  - model_name: local-analyst
+    litellm_params: { model: hosted_vllm/local, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: local-research
+    litellm_params: { model: hosted_vllm/local, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: local-creative
+    litellm_params: { model: hosted_vllm/local, api_base: "http://10.30.10.111:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+
+  # DGX/PGX single aliases
+  - model_name: local-dgx
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.81:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: qwen3.5-122b
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.82:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+
+  # ── CPU: GLM-4.7 (RTX llama.cpp) ──
+  - model_name: host
+    litellm_params: { model: hosted_vllm/glm-4.7, api_base: "http://10.30.10.111:8018/v1", api_key: dummy-key }
+  - model_name: glm-4.7
+    litellm_params: { model: hosted_vllm/glm-4.7, api_base: "http://10.30.10.111:8018/v1", api_key: dummy-key }
+  - model_name: host2
+    litellm_params: { model: hosted_vllm/glm-4.7, api_base: "http://10.30.10.111:8018/v1", api_key: dummy-key }
+
+  # ── RZ mirror ──
+  - model_name: rz-local
+    litellm_params: { model: local, api_base: "http://10.249.0.99:8012/v1", api_key: dummy-key, max_model_len: 100000 }
+  - model_name: rz-host
+    litellm_params: { model: host, api_base: "http://10.249.0.99:8012/v1", api_key: dummy-key }
+
+  # ── local2 (reserved) ──
+  - model_name: local2
+    litellm_params: { model: hosted_vllm/local2, api_base: "http://10.30.10.111:8013/v1", api_key: dummy-key }
+
+  # ══════════════════════════════════════════════════════════════════
+  # Load-balanced alias groups (DGX .81 + PGX .82)
+  # ══════════════════════════════════════════════════════════════════
+
+  # ── local-ocr: LLM for Taki OCR/extraction ──
+  - model_name: local-ocr
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.81:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: local-ocr
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.82:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+
+  # ── llm-annotate: LLM for Taki annotation ──
+  - model_name: llm-annotate
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.81:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: llm-annotate
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.82:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+
+  # ── Embedding (nomic) ──
+  - model_name: embed
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.81:8019/v1", api_key: dummy-key }
+  - model_name: embed
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.82:8019/v1", api_key: dummy-key }
+  - model_name: local-embed
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.81:8019/v1", api_key: dummy-key }
+  - model_name: local-embed
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.82:8019/v1", api_key: dummy-key }
+  - model_name: nomic-ai/nomic-embed-text-v1.5
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.81:8019/v1", api_key: dummy-key }
+  - model_name: nomic-ai/nomic-embed-text-v1.5
+    litellm_params: { model: hosted_vllm/nomic-ai/nomic-embed-text-v1.5, api_base: "http://10.30.254.82:8019/v1", api_key: dummy-key }
+
+  # ── Whisper (ASR) ──
+  - model_name: llm-stt
+    litellm_params: { model: hosted_vllm/whisper-large-v3, api_base: "http://10.30.254.81:8017/v1", api_key: dummy-key }
+  - model_name: llm-stt
+    litellm_params: { model: hosted_vllm/whisper-large-v3, api_base: "http://10.30.254.82:8017/v1", api_key: dummy-key }
+  - model_name: whisper-large-v3
+    litellm_params: { model: hosted_vllm/whisper-large-v3, api_base: "http://10.30.254.81:8017/v1", api_key: dummy-key }
+  - model_name: whisper-large-v3
+    litellm_params: { model: hosted_vllm/whisper-large-v3, api_base: "http://10.30.254.82:8017/v1", api_key: dummy-key }
+
+  # ── Parakeet (ASR) ──
+  - model_name: llm-parakeet
+    litellm_params: { model: hosted_vllm/parakeet-tdt-0.6b-v3, api_base: "http://10.30.254.81:8018/v1", api_key: dummy-key }
+  - model_name: llm-parakeet
+    litellm_params: { model: hosted_vllm/parakeet-tdt-0.6b-v3, api_base: "http://10.30.254.82:8018/v1", api_key: dummy-key }
+  - model_name: parakeet-tdt-0.6b-v3
+    litellm_params: { model: hosted_vllm/parakeet-tdt-0.6b-v3, api_base: "http://10.30.254.81:8018/v1", api_key: dummy-key }
+  - model_name: parakeet-tdt-0.6b-v3
+    litellm_params: { model: hosted_vllm/parakeet-tdt-0.6b-v3, api_base: "http://10.30.254.82:8018/v1", api_key: dummy-key }

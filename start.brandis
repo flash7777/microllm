@@ -1,0 +1,44 @@
+#!/bin/bash
+# microllm — cloud.brandis.eu
+# Start/Replace im opencloud Podman-Netzwerk mit Traefik-Labels
+#
+# Liegt auf dem Server unter /data/microllm/start.sh
+# Wird von deploy.sh aufgerufen, nie direkt podman run.
+
+set -euo pipefail
+
+PORT="${PORT:-8012}"
+CONTAINER_NAME="microllm"
+CONFIG_DIR="/data/microllm"
+IMAGE="${IMAGE:-codeberg.org/gemini-foundation/microllm:latest}"
+NETWORK="opencloud_full_opencloud-net"
+
+echo "=== microllm starten ==="
+echo "Image:   $IMAGE"
+echo "Config:  $CONFIG_DIR/config.yaml"
+echo "Port:    $PORT"
+echo "Network: $NETWORK"
+echo ""
+
+podman stop "$CONTAINER_NAME" 2>/dev/null || true
+podman rm "$CONTAINER_NAME" 2>/dev/null || true
+
+podman run -d \
+  --name "$CONTAINER_NAME" \
+  --network "$NETWORK" \
+  -p "${PORT}:${PORT}" \
+  --restart always \
+  -v "${CONFIG_DIR}/config.yaml:/config/config.yaml:ro" \
+  --label traefik.enable=true \
+  --label "traefik.http.routers.microllm.rule=PathPrefix(\`/\`)" \
+  --label traefik.http.routers.microllm.entrypoints=ai \
+  --label traefik.http.routers.microllm.tls=true \
+  --label "traefik.http.services.microllm.loadbalancer.server.port=${PORT}" \
+  "$IMAGE" \
+  /config/config.yaml "$PORT"
+
+echo ""
+echo "Container '$CONTAINER_NAME' gestartet."
+echo "Logs:    podman logs -f $CONTAINER_NAME"
+echo "Health:  http://localhost:$PORT/health"
+echo "Models:  http://localhost:$PORT/v1/models"
