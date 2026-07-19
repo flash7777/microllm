@@ -902,7 +902,8 @@ class MicroLLM:
                     continue
                 seen_bases.add(base)
                 try:
-                    url = f"{base}/v1/models"
+                    base_stripped = base.rstrip('/')
+                    url = f"{base_stripped}/models" if base_stripped.endswith('/v1') else f"{base_stripped}/v1/models"
                     async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
@@ -967,7 +968,8 @@ class MicroLLM:
                     if backend["healthy"]:
                         continue
                     try:
-                        url = f"{backend['api_base']}/v1/models"
+                        base = backend['api_base'].rstrip('/')
+                        url = f"{base}/models" if base.endswith('/v1') else f"{base}/v1/models"
                         async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
                             if resp.status == 200:
                                 backend["healthy"] = True
