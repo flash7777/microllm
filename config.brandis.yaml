@@ -6,6 +6,12 @@ general_settings:
   chatlog_dir: /tmp/microllm-chatlog
   web_search_url: duckduckgo
 
+service_list:
+  - service_name: steno-ml
+    api_base: http://10.30.254.81:8090
+  - service_name: steno-ml
+    api_base: http://10.30.254.82:8090
+
 model_list:
   # ── LLM: Qwen3.5-122B (RTX single) ──
   - model_name: local
