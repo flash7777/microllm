@@ -25,6 +25,7 @@ class MicroLLM:
 
     HEALTH_CHECK_INTERVAL = 30     # Check unhealthy backends every 30s
     HEALTH_FAIL_THRESHOLD = 3      # Mark unhealthy after N consecutive failures
+    HEALTH_COOLDOWN = 300          # Try unhealthy backends again after 5 minutes
 
     def __init__(self, config_path, port=8012):
         self.port = port
@@ -83,7 +84,7 @@ class MicroLLM:
             }
             if "chat_template_kwargs" in params:
                 route["chat_template_kwargs"] = params["chat_template_kwargs"]
-            route["healthy"] = True
+            route["unhealthy_since"] = None
             route["fail_count"] = 0
             self.routes.setdefault(name, []).append(route)
 
@@ -91,7 +92,7 @@ class MicroLLM:
         for entry in config.get("service_list", []):
             name = entry["service_name"]
             api_base = entry.get("api_base", "").rstrip("/")
-            svc = {"api_base": api_base, "healthy": True, "fail_count": 0}
+            svc = {"api_base": api_base, "unhealthy_since": None, "fail_count": 0}
             self.services.setdefault(name, []).append(svc)
 
         print(f"microllm: {len(self.routes)} routes loaded:")
@@ -112,6 +113,13 @@ class MicroLLM:
                     for b in backends:
                         print(f"    - {b['api_base']}")
 
+    def _is_healthy(self, backend):
+        """A backend is healthy if never failed, or if cooldown has elapsed."""
+        us = backend.get("unhealthy_since")
+        if us is None:
+            return True
+        return (time.monotonic() - us) >= self.HEALTH_COOLDOWN
+
     def pick_backend(self, model_name):
         """Pick next healthy backend for model (round-robin with failover)."""
         backends = self.routes.get(model_name)
@@ -121,28 +129,29 @@ class MicroLLM:
         start = self.rr_index[model_name] % n
         for i in range(n):
             idx = (start + i) % n
-            if backends[idx]["healthy"]:
+            if self._is_healthy(backends[idx]):
                 self.rr_index[model_name] = idx + 1
                 return backends[idx]
-        # All unhealthy — try first anyway (let it fail or recover)
+        # All unhealthy and not yet cooled down — try first anyway
         self.rr_index[model_name] = start + 1
         return backends[start]
 
     def mark_failed(self, model_name, backend):
-        """Mark a backend as failed. After threshold, mark unhealthy."""
+        """Mark a backend as failed. After threshold, set unhealthy timestamp."""
         backend["fail_count"] += 1
         if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD:
-            if backend["healthy"]:
-                backend["healthy"] = False
+            if backend.get("unhealthy_since") is None:
+                backend["unhealthy_since"] = time.monotonic()
                 print(f"  {model_name}: backend {backend['api_base']} marked UNHEALTHY "
-                      f"(after {backend['fail_count']} failures)", flush=True)
+                      f"(after {backend['fail_count']} failures, retry in {self.HEALTH_COOLDOWN}s)",
+                      flush=True)
 
     def mark_success(self, model_name, backend):
-        """Mark a backend as successful. Reset fail count, restore health."""
-        if not backend["healthy"]:
+        """Mark a backend as successful. Reset fail count, clear unhealthy."""
+        if backend.get("unhealthy_since") is not None:
             print(f"  {model_name}: backend {backend['api_base']} recovered", flush=True)
         backend["fail_count"] = 0
-        backend["healthy"] = True
+        backend["unhealthy_since"] = None
 
     # --- Request handlers ---
 
@@ -528,7 +537,7 @@ class MicroLLM:
         start = self.rr_index[key] % n
         for i in range(n):
             idx = (start + i) % n
-            if backends[idx]["healthy"]:
+            if self._is_healthy(backends[idx]):
                 self.rr_index[key] = idx + 1
                 return backends[idx]
         self.rr_index[key] = start + 1
@@ -577,26 +586,28 @@ class MicroLLM:
                     elapsed = time.monotonic() - t0
                     self.stats[svc_key]["total_gen_s"] += elapsed
                     backend["fail_count"] = 0
-                    if not backend["healthy"]:
-                        backend["healthy"] = True
+                    if backend.get("unhealthy_since") is not None:
+                        backend["unhealthy_since"] = None
                         print(f"  svc:{service_name}: backend {backend['api_base']} recovered", flush=True)
                     ct = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
                     print(f"  svc:{service_name:15s}  {resp.status}  {elapsed:5.1f}s  "
                           f"{backend['api_base']}/{sub_path}", flush=True)
                     if resp.status >= 500 and attempt + 1 < max_tries:
                         backend["fail_count"] += 1
-                        if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend["healthy"]:
-                            backend["healthy"] = False
-                            print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY", flush=True)
+                        if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend.get("unhealthy_since") is None:
+                            backend["unhealthy_since"] = time.monotonic()
+                            print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY "
+                                  f"(retry in {self.HEALTH_COOLDOWN}s)", flush=True)
                         print(f"  svc:{service_name}: backend {backend['api_base']} returned {resp.status}, "
                               f"trying next ({attempt+1}/{max_tries})", flush=True)
                         continue
                     return web.Response(body=resp_body, status=resp.status, content_type=ct)
             except Exception as e:
                 backend["fail_count"] += 1
-                if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend["healthy"]:
-                    backend["healthy"] = False
-                    print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY", flush=True)
+                if backend["fail_count"] >= self.HEALTH_FAIL_THRESHOLD and backend.get("unhealthy_since") is None:
+                    backend["unhealthy_since"] = time.monotonic()
+                    print(f"  svc:{service_name}: backend {backend['api_base']} marked UNHEALTHY "
+                          f"(retry in {self.HEALTH_COOLDOWN}s)", flush=True)
                 last_error = e
                 if max_tries > 1:
                     print(f"  svc:{service_name}: backend {backend['api_base']} failed ({e}), "
@@ -618,7 +629,7 @@ class MicroLLM:
 
         models = []
         for name, backends in self.routes.items():
-            healthy = [b for b in backends if b["healthy"]]
+            healthy = [b for b in backends if self._is_healthy(b)]
             models.append({
                 "id": name,
                 "object": "model",
@@ -639,7 +650,8 @@ class MicroLLM:
             else:
                 s["avg_tok_s"] = 0
             s["backends"] = [
-                {"api_base": b["api_base"], "healthy": b["healthy"], "fail_count": b["fail_count"]}
+                {"api_base": b["api_base"], "healthy": self._is_healthy(b), "fail_count": b["fail_count"],
+                 "unhealthy_since": b.get("unhealthy_since")}
                 for b in backends
             ]
             models[name] = s
@@ -914,15 +926,15 @@ class MicroLLM:
                                     "max_model_len": models[0].get("max_model_len", 0),
                                     "models": models,
                                 }
-                                backend["healthy"] = True
+                                backend["unhealthy_since"] = None
                                 backend["fail_count"] = 0
                                 print(f"  {base}: {models[0].get('id','')} (ctx:{models[0].get('max_model_len',0)})", flush=True)
                         else:
                             print(f"  {base}: HTTP {resp.status}", flush=True)
-                            backend["healthy"] = False
+                            backend["unhealthy_since"] = time.monotonic()
                 except Exception as e:
                     print(f"  {base}: {type(e).__name__} - {e}", flush=True)
-                    backend["healthy"] = False
+                    backend["unhealthy_since"] = time.monotonic()
 
         # Update backend model names from discovery
         for name, backends in self.routes.items():
@@ -951,7 +963,7 @@ class MicroLLM:
                         "model": mid,
                         "api_key": api_key,
                         "max_model_len": m.get("max_model_len", 0),
-                        "healthy": True,
+                        "unhealthy_since": None,
                         "fail_count": 0,
                     }]
                     print(f"  + alias: {mid}", flush=True)
@@ -960,23 +972,42 @@ class MicroLLM:
         print(flush=True)
 
     async def _health_check_loop(self):
-        """Periodically check unhealthy backends and restore them."""
+        """Periodically probe unhealthy backends whose cooldown has elapsed."""
         while True:
             await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
+            # Check LLM routes
             for name, backends in self.routes.items():
                 for backend in backends:
-                    if backend["healthy"]:
+                    if backend.get("unhealthy_since") is None:
                         continue
+                    if not self._is_healthy(backend):
+                        continue  # Cooldown not yet elapsed
                     try:
                         base = backend['api_base'].rstrip('/')
                         url = f"{base}/models" if base.endswith('/v1') else f"{base}/v1/models"
                         async with self.session.get(url, timeout=ClientTimeout(total=5)) as resp:
                             if resp.status == 200:
-                                backend["healthy"] = True
+                                backend["unhealthy_since"] = None
                                 backend["fail_count"] = 0
-                                print(f"  {name}: backend {backend['api_base']} recovered", flush=True)
+                                print(f"  {name}: backend {backend['api_base']} recovered (health check)", flush=True)
                     except Exception:
-                        pass  # Still unhealthy
+                        backend["unhealthy_since"] = time.monotonic()  # Reset cooldown
+            # Check service backends
+            for name, backends in self.services.items():
+                for backend in backends:
+                    if backend.get("unhealthy_since") is None:
+                        continue
+                    if not self._is_healthy(backend):
+                        continue
+                    try:
+                        base = backend['api_base'].rstrip('/')
+                        async with self.session.get(base, timeout=ClientTimeout(total=5)) as resp:
+                            if resp.status < 500:
+                                backend["unhealthy_since"] = None
+                                backend["fail_count"] = 0
+                                print(f"  svc:{name}: backend {backend['api_base']} recovered (health check)", flush=True)
+                    except Exception:
+                        backend["unhealthy_since"] = time.monotonic()
 
     async def run(self):
         connector = TCPConnector(
