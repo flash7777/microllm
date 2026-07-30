@@ -26,12 +26,14 @@ class MicroLLM:
     HEALTH_CHECK_INTERVAL = 30     # Check unhealthy backends every 30s
     HEALTH_FAIL_THRESHOLD = 3      # Mark unhealthy after N consecutive failures
     HEALTH_COOLDOWN = 300          # Try unhealthy backends again after 5 minutes
+    MAX_CONCURRENT_PER_BACKEND = 4 # Max parallel requests per backend
 
     def __init__(self, config_path, port=8012):
         self.port = port
         self.routes = {}        # model_name -> [backend, ...]  (list for round-robin)
         self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
+        self.backend_semaphores = {}  # api_base -> asyncio.Semaphore
         self.ocr_url = None     # OCR service URL (e.g. http://localhost:8019)
         self.stats = defaultdict(lambda: {
             "requests": 0, "tokens_in": 0, "tokens_out": 0,
@@ -44,6 +46,12 @@ class MicroLLM:
         self.chatlog_seq = 0
         self.load_config(config_path)
 
+    def get_backend_semaphore(self, api_base):
+        """Get or create a semaphore for a backend (limits concurrent requests)."""
+        if api_base not in self.backend_semaphores:
+            self.backend_semaphores[api_base] = asyncio.Semaphore(self.MAX_CONCURRENT_PER_BACKEND)
+        return self.backend_semaphores[api_base]
+
     def load_config(self, path):
         with open(path) as f:
             config = yaml.safe_load(f)
@@ -55,6 +63,7 @@ class MicroLLM:
             self.ocr_url = self.ocr_url.rstrip("/")
             print(f"microllm: OCR service at {self.ocr_url}")
 
+        self.MAX_CONCURRENT_PER_BACKEND = settings.get("max_concurrent_per_backend", 4)
         self.web_search_url = settings.get("web_search_url", None)
         if self.web_search_url:
             self.web_search_url = self.web_search_url.rstrip("/")
@@ -312,14 +321,16 @@ class MicroLLM:
                 self._chatlog_write(req_seq, "req", send_data, model_name)
 
             try:
-                async with self.session.post(url, data=body_out, headers=headers) as resp:
-                    content_type = resp.headers.get("content-type", "")
-                    self.mark_success(model_name, route)
+                sem = self.get_backend_semaphore(route["api_base"])
+                async with sem:
+                    async with self.session.post(url, data=body_out, headers=headers) as resp:
+                        content_type = resp.headers.get("content-type", "")
+                        self.mark_success(model_name, route)
 
-                    if is_stream or "text/event-stream" in content_type:
-                        return await self._stream_response(request, resp, model_name, t0, req_seq)
-                    else:
-                        return await self._buffered_response(resp, model_name, t0, req_seq)
+                        if is_stream or "text/event-stream" in content_type:
+                            return await self._stream_response(request, resp, model_name, t0, req_seq)
+                        else:
+                            return await self._buffered_response(resp, model_name, t0, req_seq)
             except Exception as e:
                 self.mark_failed(model_name, route)
                 last_error = e
@@ -509,7 +520,8 @@ class MicroLLM:
         t0 = time.monotonic()
 
         try:
-            async with self.session.request(
+            sem = self.get_backend_semaphore(route["api_base"])
+            async with sem, self.session.request(
                 request.method, url, data=body_raw, headers=headers,
                 timeout=ClientTimeout(total=600),
             ) as resp:
