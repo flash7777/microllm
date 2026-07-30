@@ -46,10 +46,11 @@ class MicroLLM:
         self.chatlog_seq = 0
         self.load_config(config_path)
 
-    def get_backend_semaphore(self, api_base):
+    def get_backend_semaphore(self, api_base, max_concurrent=None):
         """Get or create a semaphore for a backend (limits concurrent requests)."""
         if api_base not in self.backend_semaphores:
-            self.backend_semaphores[api_base] = asyncio.Semaphore(self.MAX_CONCURRENT_PER_BACKEND)
+            limit = max_concurrent or self.MAX_CONCURRENT_PER_BACKEND
+            self.backend_semaphores[api_base] = asyncio.Semaphore(limit)
         return self.backend_semaphores[api_base]
 
     def load_config(self, path):
@@ -90,6 +91,7 @@ class MicroLLM:
                 "model": model,
                 "api_key": api_key,
                 "max_model_len": int(params.get("max_model_len", 0)),
+                "max_concurrent": int(params.get("max_concurrent", 0)),  # 0 = use global default
             }
             if "chat_template_kwargs" in params:
                 route["chat_template_kwargs"] = params["chat_template_kwargs"]
@@ -321,7 +323,7 @@ class MicroLLM:
                 self._chatlog_write(req_seq, "req", send_data, model_name)
 
             try:
-                sem = self.get_backend_semaphore(route["api_base"])
+                sem = self.get_backend_semaphore(route["api_base"], route.get("max_concurrent") or None)
                 async with sem:
                     async with self.session.post(url, data=body_out, headers=headers) as resp:
                         content_type = resp.headers.get("content-type", "")
