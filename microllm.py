@@ -664,6 +664,14 @@ class MicroLLM:
             dumps=lambda x: json.dumps(x, indent=2),
         )
 
+    async def handle_stats_reset(self, request):
+        self.stats = defaultdict(lambda: {
+            "requests": 0, "tokens_in": 0, "tokens_out": 0,
+            "errors": 0, "total_gen_s": 0.0, "last_tok_s": 0.0,
+        })
+        self.start_time = time.time()
+        return web.json_response({"status": "reset"})
+
     # --- OCR Integration ---
 
     async def _process_document_blocks(self, data):
@@ -1028,6 +1036,7 @@ class MicroLLM:
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/stats", self.handle_stats)
+        app.router.add_post("/stats/reset", self.handle_stats_reset)
         app.router.add_route("*", "/svc/{service}/{path:.*}", self.handle_service)
         app.router.add_route("*", "/{path:.*}", self.handle_proxy)
 
