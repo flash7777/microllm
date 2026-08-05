@@ -663,11 +663,17 @@ class MicroLLM:
                 s["avg_tok_s"] = round(s["tokens_out"] / s["total_gen_s"], 1)
             else:
                 s["avg_tok_s"] = 0
-            s["backends"] = [
-                {"api_base": b["api_base"], "healthy": self._is_healthy(b), "fail_count": b["fail_count"],
-                 "unhealthy_since": b.get("unhealthy_since")}
-                for b in backends
-            ]
+            backend_list = []
+            for b in backends:
+                entry = {"api_base": b["api_base"], "healthy": self._is_healthy(b), "fail_count": b["fail_count"],
+                         "unhealthy_since": b.get("unhealthy_since")}
+                sem = self.backend_semaphores.get(b["api_base"])
+                if sem is not None:
+                    limit = b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND
+                    in_flight = limit - sem._value
+                    entry["queue"] = {"in_flight": max(0, in_flight), "max": limit}
+                backend_list.append(entry)
+            s["backends"] = backend_list
             models[name] = s
         return web.json_response(
             {
