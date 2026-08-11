@@ -9,6 +9,7 @@ Drop-in replacement for LiteLLM with compatible YAML config.
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -29,8 +30,9 @@ class MicroLLM:
     MAX_CONCURRENT_PER_BACKEND = 4 # Max parallel requests per backend
 
     def __init__(self, config_path, port=8012):
+        self.config_path = config_path
         self.port = port
-        self.routes = {}        # model_name -> [backend, ...]  (list for round-robin)
+        self.routes = {}        # model_name -> [backend, ...]  (list for least-conn)
         self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
         self.backend_semaphores = {}  # api_base -> asyncio.Semaphore
@@ -111,7 +113,7 @@ class MicroLLM:
             if len(backends) == 1:
                 print(f"  {name:20s} -> {backends[0]['api_base']}  (model: {backends[0]['model']})")
             else:
-                print(f"  {name:20s} -> {len(backends)} backends (round-robin):")
+                print(f"  {name:20s} -> {len(backends)} backends (least-conn):")
                 for b in backends:
                     print(f"    - {b['api_base']}  (model: {b['model']})")
         if self.services:
@@ -120,9 +122,144 @@ class MicroLLM:
                 if len(backends) == 1:
                     print(f"  {name:20s} -> {backends[0]['api_base']}")
                 else:
-                    print(f"  {name:20s} -> {len(backends)} backends (round-robin):")
+                    print(f"  {name:20s} -> {len(backends)} backends (least-conn):")
                     for b in backends:
                         print(f"    - {b['api_base']}")
+
+    def reload_config(self):
+        """Hot-reload config: merge new backends into existing groups, remove stale ones.
+        In-flight requests keep their backend references and semaphores — safe to call anytime."""
+        print(f"\nmicrollm: reloading {self.config_path}...", flush=True)
+        try:
+            with open(self.config_path) as f:
+                config = yaml.safe_load(f)
+        except Exception as e:
+            print(f"microllm: reload FAILED: {e}", flush=True)
+            return f"reload failed: {e}"
+
+        settings = config.get("general_settings", {})
+        self.ocr_url = settings.get("ocr_url", None)
+        if self.ocr_url:
+            self.ocr_url = self.ocr_url.rstrip("/")
+        self.MAX_CONCURRENT_PER_BACKEND = settings.get("max_concurrent_per_backend", 4)
+        self.web_search_url = settings.get("web_search_url", None)
+        if self.web_search_url:
+            self.web_search_url = self.web_search_url.rstrip("/")
+        self.chatlog_dir = settings.get("chatlog_dir", None)
+        if self.chatlog_dir:
+            os.makedirs(self.chatlog_dir, exist_ok=True)
+
+        # Parse new model backends
+        new_routes = {}
+        for entry in config.get("model_list", []):
+            name = entry["model_name"]
+            params = entry.get("litellm_params", entry.get("params", {}))
+            raw_model = params.get("model", name)
+            model = raw_model.split("/", 1)[-1] if "/" in raw_model else raw_model
+            api_base = params.get("api_base", "").rstrip("/")
+            if api_base.endswith("/v1"):
+                api_base = api_base[:-3]
+            api_key = params.get("api_key", "dummy")
+            route = {
+                "api_base": api_base, "model": model, "api_key": api_key,
+                "max_model_len": int(params.get("max_model_len", 0)),
+                "max_concurrent": int(params.get("max_concurrent", 0)),
+                "unhealthy_since": None, "fail_count": 0,
+            }
+            if "chat_template_kwargs" in params:
+                route["chat_template_kwargs"] = params["chat_template_kwargs"]
+            new_routes.setdefault(name, []).append(route)
+
+        # Parse new service backends
+        new_services = {}
+        for entry in config.get("service_list", []):
+            name = entry["service_name"]
+            api_base = entry.get("api_base", "").rstrip("/")
+            new_services.setdefault(name, []).append({
+                "api_base": api_base, "unhealthy_since": None, "fail_count": 0,
+            })
+
+        added, removed = 0, 0
+
+        # Merge model routes
+        for name, new_backends in new_routes.items():
+            if name not in self.routes:
+                self.routes[name] = new_backends
+                added += len(new_backends)
+                print(f"  + new route: {name} ({len(new_backends)} backends)", flush=True)
+                continue
+            existing = self.routes[name]
+            existing_bases = {b["api_base"] for b in existing}
+            new_bases = {b["api_base"] for b in new_backends}
+            # Add new backends
+            for b in new_backends:
+                if b["api_base"] not in existing_bases:
+                    existing.append(b)
+                    added += 1
+                    print(f"  + {name}: added {b['api_base']}", flush=True)
+            # Remove backends no longer in config (only if no in-flight requests)
+            keep = []
+            for b in existing:
+                if b["api_base"] not in new_bases:
+                    sem = self.backend_semaphores.get(b["api_base"])
+                    limit = b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND
+                    in_flight = (limit - sem._value) if sem else 0
+                    if in_flight > 0:
+                        print(f"  ~ {name}: keeping {b['api_base']} (draining, {in_flight} in-flight)", flush=True)
+                        keep.append(b)
+                    else:
+                        removed += 1
+                        print(f"  - {name}: removed {b['api_base']}", flush=True)
+                else:
+                    keep.append(b)
+            self.routes[name] = keep
+
+        # Remove routes no longer in config (only if empty after backend removal)
+        for name in list(self.routes.keys()):
+            if name not in new_routes and not any(
+                    b["api_base"] in self.backend_semaphores and
+                    ((b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND) -
+                     self.backend_semaphores[b["api_base"]]._value) > 0
+                    for b in self.routes[name]):
+                del self.routes[name]
+                print(f"  - removed route: {name}", flush=True)
+
+        # Merge service routes (same logic)
+        for name, new_backends in new_services.items():
+            if name not in self.services:
+                self.services[name] = new_backends
+                added += len(new_backends)
+                continue
+            existing = self.services[name]
+            existing_bases = {b["api_base"] for b in existing}
+            new_bases = {b["api_base"] for b in new_backends}
+            for b in new_backends:
+                if b["api_base"] not in existing_bases:
+                    existing.append(b)
+                    added += 1
+                    print(f"  + svc:{name}: added {b['api_base']}", flush=True)
+            keep = []
+            for b in existing:
+                if b["api_base"] not in new_bases:
+                    sem = self.backend_semaphores.get(b["api_base"])
+                    in_flight = (self.MAX_CONCURRENT_PER_BACKEND - sem._value) if sem else 0
+                    if in_flight > 0:
+                        keep.append(b)
+                    else:
+                        removed += 1
+                        print(f"  - svc:{name}: removed {b['api_base']}", flush=True)
+                else:
+                    keep.append(b)
+            self.services[name] = keep
+
+        msg = f"reload ok: +{added} -{removed} backends, {len(self.routes)} routes, {len(self.services)} services"
+        print(f"microllm: {msg}\n", flush=True)
+        return msg
+
+    async def handle_reload(self, request):
+        """HTTP endpoint for config reload."""
+        msg = self.reload_config()
+        return web.json_response({"status": msg})
 
     def _is_healthy(self, backend):
         """A backend is healthy if never failed, or if cooldown has elapsed."""
@@ -132,18 +269,26 @@ class MicroLLM:
         return (time.monotonic() - us) >= self.HEALTH_COOLDOWN
 
     def pick_backend(self, model_name):
-        """Pick next healthy backend for model (round-robin with failover)."""
+        """Pick healthy backend with most free slots (least-connections)."""
         backends = self.routes.get(model_name)
         if not backends:
             return None
+        best, best_free = None, -1
+        for b in backends:
+            if not self._is_healthy(b):
+                continue
+            sem = self.backend_semaphores.get(b["api_base"])
+            if sem is not None:
+                free = sem._value
+            else:
+                free = b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND
+            if free > best_free:
+                best, best_free = b, free
+        if best:
+            return best
+        # All unhealthy — fall back to round-robin over unhealthy backends
         n = len(backends)
         start = self.rr_index[model_name] % n
-        for i in range(n):
-            idx = (start + i) % n
-            if self._is_healthy(backends[idx]):
-                self.rr_index[model_name] = idx + 1
-                return backends[idx]
-        # All unhealthy and not yet cooled down — try first anyway
         self.rr_index[model_name] = start + 1
         return backends[start]
 
@@ -542,18 +687,27 @@ class MicroLLM:
     # --- Service proxy (generic HTTP, multipart, round-robin) ---
 
     def pick_service_backend(self, service_name):
-        """Pick next healthy backend for a service (round-robin)."""
+        """Pick healthy service backend with most free slots (least-connections)."""
         backends = self.services.get(service_name)
         if not backends:
             return None
+        best, best_free = None, -1
+        for b in backends:
+            if not self._is_healthy(b):
+                continue
+            sem = self.backend_semaphores.get(b["api_base"])
+            if sem is not None:
+                free = sem._value
+            else:
+                free = self.MAX_CONCURRENT_PER_BACKEND
+            if free > best_free:
+                best, best_free = b, free
+        if best:
+            return best
+        # All unhealthy — fall back to round-robin
         n = len(backends)
         key = f"svc:{service_name}"
         start = self.rr_index[key] % n
-        for i in range(n):
-            idx = (start + i) % n
-            if self._is_healthy(backends[idx]):
-                self.rr_index[key] = idx + 1
-                return backends[idx]
         self.rr_index[key] = start + 1
         return backends[start]
 
@@ -592,7 +746,8 @@ class MicroLLM:
 
             t0 = time.monotonic()
             try:
-                async with self.session.request(
+                sem = self.get_backend_semaphore(backend["api_base"])
+                async with sem, self.session.request(
                     request.method, url, data=body, headers=headers,
                     timeout=ClientTimeout(total=600),
                 ) as resp:
@@ -1057,6 +1212,7 @@ class MicroLLM:
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_get("/stats", self.handle_stats)
         app.router.add_post("/stats/reset", self.handle_stats_reset)
+        app.router.add_post("/reload", self.handle_reload)
         app.router.add_route("*", "/svc/{service}/{path:.*}", self.handle_service)
         app.router.add_route("*", "/{path:.*}", self.handle_proxy)
 
@@ -1065,10 +1221,16 @@ class MicroLLM:
         site = web.TCPSite(runner, "0.0.0.0", self.port)
         await site.start()
 
+        # SIGHUP triggers config reload
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGHUP, self.reload_config)
+
         print(f"microllm listening on 0.0.0.0:{self.port}", flush=True)
         print(f"  /health    - health check", flush=True)
         print(f"  /stats     - request statistics", flush=True)
+        print(f"  /reload    - hot-reload config (POST)", flush=True)
         print(f"  /v1/models - list routes", flush=True)
+        print(f"  SIGHUP     - hot-reload config", flush=True)
         print(flush=True)
 
         try:

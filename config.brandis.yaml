@@ -76,9 +76,25 @@ model_list:
   - model_name: rz-host
     litellm_params: { model: host, api_base: "http://10.249.0.99:8012/v1", api_key: dummy-key }
 
-  # ── local2 (reserved) ──
+  # ── RTX MiniMax-M3 428B AWQ (TP=2 + CG + hot experts, 124K ctx) ──
+  - model_name: rtx-minimax-3
+    litellm_params:
+      model: hosted_vllm/minimax-m3
+      api_base: http://10.30.10.111:8011/v1
+      api_key: dummy-key
+      max_model_len: 124000
+
+  # ── RTX Qwen3.6-27B-FP8 + MTP (GPU2, 256K ctx x6, 72 tok/s) ──
+  - model_name: rtx-qwen-3.6
+    litellm_params:
+      model: hosted_vllm/qwen36-27b
+      api_base: http://10.30.10.111:8013/v1
+      api_key: dummy-key
+      max_model_len: 256000
+
+  # ── local2 → Qwen3.6 ──
   - model_name: local2
-    litellm_params: { model: hosted_vllm/local2, api_base: "http://10.30.10.111:8013/v1", api_key: dummy-key }
+    litellm_params: { model: hosted_vllm/qwen36-27b, api_base: "http://10.30.10.111:8013/v1", api_key: dummy-key, max_model_len: 256000 }
 
   # ══════════════════════════════════════════════════════════════════
   # Load-balanced alias groups (DGX .81 + PGX .82)
