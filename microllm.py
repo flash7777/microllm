@@ -475,10 +475,11 @@ class MicroLLM:
                         content_type = resp.headers.get("content-type", "")
                         self.mark_success(model_name, route)
 
+                        backend_id = route["api_base"]
                         if is_stream or "text/event-stream" in content_type:
-                            return await self._stream_response(request, resp, model_name, t0, req_seq, client_ip)
+                            return await self._stream_response(request, resp, model_name, t0, req_seq, client_ip, backend_id)
                         else:
-                            return await self._buffered_response(resp, model_name, t0, req_seq, client_ip)
+                            return await self._buffered_response(resp, model_name, t0, req_seq, client_ip, backend_id)
             except Exception as e:
                 self.mark_failed(model_name, route)
                 last_error = e
@@ -492,7 +493,7 @@ class MicroLLM:
             status=502,
         )
 
-    async def _stream_response(self, request, resp, model_name, t0, req_seq=0, client_ip="-"):
+    async def _stream_response(self, request, resp, model_name, t0, req_seq=0, client_ip="-", backend_id="-"):
         """Forward SSE stream from backend to client with keep-alive heartbeats."""
         response = web.StreamResponse(
             status=resp.status,
@@ -501,6 +502,7 @@ class MicroLLM:
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Backend": backend_id,
             },
         )
         response.enable_chunked_encoding()
@@ -551,7 +553,7 @@ class MicroLLM:
 
         return response
 
-    async def _buffered_response(self, resp, model_name, t0, req_seq=0, client_ip="-"):
+    async def _buffered_response(self, resp, model_name, t0, req_seq=0, client_ip="-", backend_id="-"):
         """Forward non-streaming response with keep-alive for slow backends."""
         # Read response body with keep-alive timeout handling
         chunks = []
@@ -609,11 +611,13 @@ class MicroLLM:
         # Strip charset from content-type (aiohttp rejects it in content_type param)
         ct = resp.headers.get("content-type", "application/json")
         ct = ct.split(";")[0].strip()
-        return web.Response(
+        response = web.Response(
             body=resp_body,
             status=resp.status,
             content_type=ct,
         )
+        response.headers["X-Backend"] = backend_id
+        return response
 
     # --- Passthrough proxy (multipart/audio, no JSON parsing) ---
 
@@ -680,7 +684,9 @@ class MicroLLM:
                 self.stats[model_name]["total_gen_s"] += elapsed
                 ct = resp.headers.get("content-type", "application/json").split(";")[0].strip()
                 self._log(model_name, f"pt:{resp.status}", elapsed, client_ip)
-                return web.Response(body=resp_body, status=resp.status, content_type=ct)
+                pt_resp = web.Response(body=resp_body, status=resp.status, content_type=ct)
+                pt_resp.headers["X-Backend"] = route["api_base"]
+                return pt_resp
         except Exception as e:
             self.mark_failed(model_name, route)
             self.stats[model_name]["errors"] += 1
