@@ -428,6 +428,7 @@ class MicroLLM:
             )
 
         is_stream = data.get("stream", False)
+        client_ip = self._client_ip(request)
         self.stats[model_name]["requests"] += 1
         self.chatlog_seq += 1
         req_seq = self.chatlog_seq
@@ -475,9 +476,9 @@ class MicroLLM:
                         self.mark_success(model_name, route)
 
                         if is_stream or "text/event-stream" in content_type:
-                            return await self._stream_response(request, resp, model_name, t0, req_seq)
+                            return await self._stream_response(request, resp, model_name, t0, req_seq, client_ip)
                         else:
-                            return await self._buffered_response(resp, model_name, t0, req_seq)
+                            return await self._buffered_response(resp, model_name, t0, req_seq, client_ip)
             except Exception as e:
                 self.mark_failed(model_name, route)
                 last_error = e
@@ -491,7 +492,7 @@ class MicroLLM:
             status=502,
         )
 
-    async def _stream_response(self, request, resp, model_name, t0, req_seq=0):
+    async def _stream_response(self, request, resp, model_name, t0, req_seq=0, client_ip="-"):
         """Forward SSE stream from backend to client with keep-alive heartbeats."""
         response = web.StreamResponse(
             status=resp.status,
@@ -543,14 +544,14 @@ class MicroLLM:
             elapsed = time.monotonic() - t0
             self.stats[model_name]["total_gen_s"] += elapsed
             status = f"stream" if heartbeats_sent == 0 else f"str+{heartbeats_sent}ka"
-            self._log(model_name, status, elapsed)
+            self._log(model_name, status, elapsed, client_ip)
             # Chatlog: write streamed response
             if self.chatlog_dir and chunks_log:
                 self._chatlog_write_stream(req_seq, chunks_log, model_name)
 
         return response
 
-    async def _buffered_response(self, resp, model_name, t0, req_seq=0):
+    async def _buffered_response(self, resp, model_name, t0, req_seq=0, client_ip="-"):
         """Forward non-streaming response with keep-alive for slow backends."""
         # Read response body with keep-alive timeout handling
         chunks = []
@@ -597,7 +598,7 @@ class MicroLLM:
             pass
 
         status = f"{resp.status}" if heartbeats_sent == 0 else f"{resp.status}+{heartbeats_sent}w"
-        self._log(model_name, status, elapsed)
+        self._log(model_name, status, elapsed, client_ip)
 
         # Chatlog: write buffered response
         if self.chatlog_dir:
@@ -663,6 +664,7 @@ class MicroLLM:
             if key.lower() not in ("host", "transfer-encoding"):
                 headers[key] = val
 
+        client_ip = self._client_ip(request)
         self.stats[model_name]["requests"] += 1
         t0 = time.monotonic()
 
@@ -677,7 +679,7 @@ class MicroLLM:
                 self.mark_success(model_name, route)
                 self.stats[model_name]["total_gen_s"] += elapsed
                 ct = resp.headers.get("content-type", "application/json").split(";")[0].strip()
-                self._log(model_name, f"pt:{resp.status}", elapsed)
+                self._log(model_name, f"pt:{resp.status}", elapsed, client_ip)
                 return web.Response(body=resp_body, status=resp.status, content_type=ct)
         except Exception as e:
             self.mark_failed(model_name, route)
@@ -723,6 +725,7 @@ class MicroLLM:
             )
 
         body = await request.read()
+        client_ip = self._client_ip(request)
         backends = self.services[service_name]
         max_tries = len(backends)
         last_error = None
@@ -759,7 +762,7 @@ class MicroLLM:
                         backend["unhealthy_since"] = None
                         print(f"  svc:{service_name}: backend {backend['api_base']} recovered", flush=True)
                     ct = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-                    print(f"  svc:{service_name:15s}  {resp.status}  {elapsed:5.1f}s  "
+                    print(f"  {client_ip:15s}  svc:{service_name:15s}  {resp.status}  {elapsed:5.1f}s  "
                           f"{backend['api_base']}/{sub_path}", flush=True)
                     if resp.status >= 500 and attempt + 1 < max_tries:
                         backend["fail_count"] += 1
@@ -1073,8 +1076,17 @@ class MicroLLM:
 
     # --- Helpers ---
 
-    def _log(self, model, status, elapsed):
-        print(f"  {model:20s}  {status:6s}  {elapsed:7.1f}s  "
+    @staticmethod
+    def _client_ip(request):
+        """Extract client IP from request (X-Forwarded-For or peername)."""
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+        peername = request.transport.get_extra_info("peername")
+        return peername[0] if peername else "?"
+
+    def _log(self, model, status, elapsed, client_ip="-"):
+        print(f"  {client_ip:15s}  {model:20s}  {status:6s}  {elapsed:7.1f}s  "
               f"reqs={self.stats[model]['requests']}  "
               f"in={self.stats[model]['tokens_in']}  "
               f"out={self.stats[model]['tokens_out']}", flush=True)

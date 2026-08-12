@@ -100,17 +100,25 @@ model_list:
   # Load-balanced alias groups (DGX .81 + PGX .82)
   # ══════════════════════════════════════════════════════════════════
 
-  # ── local-ocr: LLM for Taki OCR/extraction ──
+  # ── local-ocr: LLM for Taki OCR/extraction (DGX + PGX + RTX GPU0/1) ──
   - model_name: local-ocr
     litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.81:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
   - model_name: local-ocr
     litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.82:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: local-ocr
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8014/v1", api_key: dummy-key, max_model_len: 262144, max_concurrent: 4, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: local-ocr
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8015/v1", api_key: dummy-key, max_model_len: 262144, max_concurrent: 4, chat_template_kwargs: { enable_thinking: false } }
 
-  # ── llm-annotate: LLM for Taki annotation ──
+  # ── llm-annotate: LLM for Taki annotation (DGX + PGX + RTX GPU0/1) ──
   - model_name: llm-annotate
     litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.81:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
   - model_name: llm-annotate
     litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.254.82:8011/v1", api_key: dummy-key, max_model_len: 100000, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: llm-annotate
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8014/v1", api_key: dummy-key, max_model_len: 262144, max_concurrent: 4, chat_template_kwargs: { enable_thinking: false } }
+  - model_name: llm-annotate
+    litellm_params: { model: hosted_vllm/qwen3.5-122b, api_base: "http://10.30.10.111:8015/v1", api_key: dummy-key, max_model_len: 262144, max_concurrent: 4, chat_template_kwargs: { enable_thinking: false } }
 
   # ── Embedding (nomic) ──
   - model_name: embed
