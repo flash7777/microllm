@@ -84,17 +84,17 @@ model_list:
       api_key: dummy-key
       max_model_len: 124000
 
-  # ── RTX Qwen3.6-27B-FP8 + MTP (GPU2, 256K ctx x6, 72 tok/s) ──
-  - model_name: rtx-qwen-3.6
+  # ── RTX Qwen3.8-27B-FP8 (GPU2, 262K ctx, KV FP8) ──
+  - model_name: rtx-qwen-3.8
     litellm_params:
-      model: hosted_vllm/qwen36-27b
+      model: hosted_vllm/qwen38-27b
       api_base: http://10.30.10.111:8013/v1
       api_key: dummy-key
       max_model_len: 256000
 
-  # ── local2 → Qwen3.6 ──
+  # ── local2 → Qwen3.8 ──
   - model_name: local2
-    litellm_params: { model: hosted_vllm/qwen36-27b, api_base: "http://10.30.10.111:8013/v1", api_key: dummy-key, max_model_len: 256000 }
+    litellm_params: { model: hosted_vllm/qwen38-27b, api_base: "http://10.30.10.111:8013/v1", api_key: dummy-key, max_model_len: 256000 }
 
   # ══════════════════════════════════════════════════════════════════
   # Load-balanced alias groups (DGX .81 + PGX .82)
