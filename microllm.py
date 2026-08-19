@@ -510,6 +510,9 @@ class MicroLLM:
 
         chunks_log = []
         heartbeats_sent = 0
+        sse_buf = b""
+        stream_text_parts = []
+        stream_usage = None
         try:
             # Use async iteration with timeout for keep-alive
             reader = resp.content
@@ -530,6 +533,28 @@ class MicroLLM:
                     await response.write(chunk)
                     if self.chatlog_dir:
                         chunks_log.append(chunk)
+                    # Token-Accounting: SSE-Events aus dem Stream parsen (ohne Netz-Overhead)
+                    sse_buf += chunk
+                    while b"\n\n" in sse_buf:
+                        event_raw, sse_buf = sse_buf.split(b"\n\n", 1)
+                        ev = self._parse_sse_event(event_raw)
+                        if ev:
+                            # OpenAI-Stil: choices[].delta.content
+                            for ch in ev.get("choices", []):
+                                txt = ch.get("delta", {}).get("content")
+                                if txt:
+                                    stream_text_parts.append(txt)
+                            # Anthropic-Stil: content_block_delta
+                            if ev.get("type") == "content_block_delta":
+                                d = ev.get("delta", {})
+                                if d.get("type") == "text_delta":
+                                    t = d.get("text", "")
+                                    if t:
+                                        stream_text_parts.append(t)
+                            # usage (letztes Chunk, OpenAI- oder Anthropic-Format)
+                            u = ev.get("usage")
+                            if u:
+                                stream_usage = u
                 except asyncio.TimeoutError:
                     # No data within interval - send SSE keep-alive comment
                     heartbeats_sent += 1
@@ -545,6 +570,22 @@ class MicroLLM:
                 pass
             elapsed = time.monotonic() - t0
             self.stats[model_name]["total_gen_s"] += elapsed
+            # Token-Zählung für Streamed-Responses
+            usage = stream_usage
+            tok_in = 0
+            tok_out = 0
+            if usage:
+                tok_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+                tok_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+            if tok_out == 0 and stream_text_parts:
+                # Fallback: Output-Token aus dem gesammelten Text schätzen
+                tok_out = max(1, len("".join(stream_text_parts).split()))
+            if tok_in:
+                self.stats[model_name]["tokens_in"] += tok_in
+            if tok_out:
+                self.stats[model_name]["tokens_out"] += tok_out
+                if elapsed > 0:
+                    self.stats[model_name]["last_tok_s"] = round(tok_out / elapsed, 1)
             status = f"stream" if heartbeats_sent == 0 else f"str+{heartbeats_sent}ka"
             self._log(model_name, status, elapsed, client_ip)
             # Chatlog: write streamed response
@@ -552,6 +593,18 @@ class MicroLLM:
                 self._chatlog_write_stream(req_seq, chunks_log, model_name)
 
         return response
+
+    def _parse_sse_event(self, event_bytes):
+        """Ein SSE-Event (Bytes) in ein dict parsen. Liefert None, wenn unparsebar."""
+        text = event_bytes.decode("utf-8", errors="replace")
+        for ln in text.splitlines():
+            ln = ln.strip()
+            if ln.startswith("data:") and ln[5:].strip() not in ("", "[DONE]"):
+                try:
+                    return json.loads(ln[5:].strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return None
 
     async def _buffered_response(self, resp, model_name, t0, req_seq=0, client_ip="-", backend_id="-"):
         """Forward non-streaming response with keep-alive for slow backends."""
