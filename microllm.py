@@ -9,6 +9,7 @@ Drop-in replacement for LiteLLM with compatible YAML config.
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -33,6 +34,7 @@ class MicroLLM:
         self.config_path = config_path
         self.port = port
         self.routes = {}        # model_name -> [backend, ...]  (list for least-conn)
+        self.alias_rules = []   # [(compiled_regex, target_group), ...]  (model_match entries)
         self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
         self.backend_semaphores = {}  # api_base -> asyncio.Semaphore
@@ -77,7 +79,12 @@ class MicroLLM:
             os.makedirs(self.chatlog_dir, exist_ok=True)
             print(f"microllm: chatlog -> {self.chatlog_dir}")
 
+        # Pass 1: concrete backends (alias_of entries are resolved in pass 2)
+        alias_entries = []
         for entry in config.get("model_list", []):
+            if "alias_of" in entry:
+                alias_entries.append(entry)
+                continue
             name = entry["model_name"]
             params = entry.get("litellm_params", entry.get("params", {}))
             raw_model = params.get("model", name)
@@ -100,6 +107,46 @@ class MicroLLM:
             route["unhealthy_since"] = None
             route["fail_count"] = 0
             self.routes.setdefault(name, []).append(route)
+
+        # Pass 2: alias entries — exact alias (model_name + alias_of) shares the
+        # target group's backend list (health state + semaphores included);
+        # regex alias (model_match + alias_of) routes unknown model names.
+        self.alias_rules = []
+        alias_names = set()
+        for entry in alias_entries:
+            target = entry["alias_of"]
+            if "litellm_params" in entry or "params" in entry:
+                print(f"  ! alias entry with litellm_params + alias_of -> skipped")
+                continue
+            name = entry.get("model_name")
+            pattern = entry.get("model_match")
+            if not name and not pattern or (name and pattern):
+                print(f"  ! alias entry needs exactly one of model_name/model_match -> skipped")
+                continue
+            if target in alias_names:
+                print(f"  ! alias target '{target}' is itself an alias (no chaining) -> skipped")
+                continue
+            if pattern:
+                try:
+                    compiled = re.compile(pattern)
+                except re.error as e:
+                    print(f"  ! model_match '{pattern}': bad regex ({e}) -> skipped")
+                    continue
+                if target not in self.routes:
+                    print(f"  ! model_match '{pattern}' -> unknown group '{target}' -> skipped")
+                    continue
+                self.alias_rules.append((compiled, target))
+                print(f"  ~ regex: {pattern} -> {target}")
+            else:
+                if name in self.routes:
+                    print(f"  ! alias '{name}' overwrites existing route -> skipped")
+                    continue
+                if target not in self.routes:
+                    print(f"  ! alias '{name}' -> unknown group '{target}' -> skipped")
+                    continue
+                self.routes[name] = self.routes[target]
+                alias_names.add(name)
+                print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)")
 
         # Load service routes (generic HTTP proxy with round-robin)
         for entry in config.get("service_list", []):
@@ -149,9 +196,25 @@ class MicroLLM:
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
 
-        # Parse new model backends
+        # Parse new model backends (alias_of entries are resolved after merging)
         new_routes = {}
+        new_aliases = {}       # model_name -> target group
+        new_alias_rules = []   # (pattern, target group)
         for entry in config.get("model_list", []):
+            if "alias_of" in entry:
+                if "litellm_params" in entry or "params" in entry:
+                    print(f"  ! alias entry with litellm_params + alias_of -> skipped", flush=True)
+                    continue
+                name = entry.get("model_name")
+                pattern = entry.get("model_match")
+                if not name and not pattern or (name and pattern):
+                    print(f"  ! alias entry needs exactly one of model_name/model_match -> skipped", flush=True)
+                    continue
+                if pattern:
+                    new_alias_rules.append((pattern, entry["alias_of"]))
+                else:
+                    new_aliases[name] = entry["alias_of"]
+                continue
             name = entry["model_name"]
             params = entry.get("litellm_params", entry.get("params", {}))
             raw_model = params.get("model", name)
@@ -215,14 +278,53 @@ class MicroLLM:
             self.routes[name] = keep
 
         # Remove routes no longer in config (only if empty after backend removal)
+        valid_names = set(new_routes) | set(new_aliases)
         for name in list(self.routes.keys()):
-            if name not in new_routes and not any(
+            if name not in valid_names and not any(
                     b["api_base"] in self.backend_semaphores and
                     ((b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND) -
                      self.backend_semaphores[b["api_base"]]._value) > 0
                     for b in self.routes[name]):
                 del self.routes[name]
                 print(f"  - removed route: {name}", flush=True)
+
+        # Re-resolve alias routes: exact aliases share the (just merged) target
+        # group's backend list; stale aliases are removed (drain-aware).
+        for name, target in new_aliases.items():
+            if name in new_routes:
+                print(f"  ! alias '{name}' overwrites existing route -> skipped", flush=True)
+                continue
+            if target in new_aliases:
+                print(f"  ! alias target '{target}' is itself an alias (no chaining) -> skipped", flush=True)
+                continue
+            if target in self.routes:
+                self.routes[name] = self.routes[target]
+                print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)", flush=True)
+            else:
+                if name in self.routes and not any(
+                        b["api_base"] in self.backend_semaphores and
+                        ((b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND) -
+                         self.backend_semaphores[b["api_base"]]._value) > 0
+                        for b in self.routes[name]):
+                    del self.routes[name]
+                    print(f"  - removed alias: {name} (target {target} gone)", flush=True)
+
+        # Rebuild regex alias rules
+        self.alias_rules = []
+        for pattern, target in new_alias_rules:
+            try:
+                compiled = re.compile(pattern)
+            except re.error as e:
+                print(f"  ! model_match '{pattern}': bad regex ({e}) -> skipped", flush=True)
+                continue
+            if target in new_aliases:
+                print(f"  ! model_match '{pattern}' -> alias '{target}' (no chaining) -> skipped", flush=True)
+                continue
+            if target in self.routes:
+                self.alias_rules.append((compiled, target))
+                print(f"  ~ regex: {pattern} -> {target}", flush=True)
+            else:
+                print(f"  ! model_match '{pattern}' -> unknown group '{target}' -> skipped", flush=True)
 
         # Merge service routes (same logic)
         for name, new_backends in new_services.items():
@@ -417,15 +519,22 @@ class MicroLLM:
 
         model_name = data.get("model", "")
         if model_name not in self.routes:
-            return web.json_response(
-                {
-                    "error": {
-                        "message": f"Unknown model: '{model_name}'. Available: {list(self.routes.keys())}",
-                        "type": "invalid_request_error",
-                    }
-                },
-                status=404,
-            )
+            # Regex aliases (model_match): first matching rule wins
+            for pattern, target in self.alias_rules:
+                if pattern.search(model_name):
+                    print(f"  {model_name} -> group {target} (regex '{pattern.pattern}')", flush=True)
+                    model_name = target
+                    break
+            else:
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": f"Unknown model: '{model_name}'. Available: {list(self.routes.keys())}",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                    status=404,
+                )
 
         is_stream = data.get("stream", False)
         client_ip = self._client_ip(request)
@@ -868,6 +977,17 @@ class MicroLLM:
                 "healthy": len(healthy),
                 "backend": backends[0]["api_base"],
                 "backend_model": backends[0]["model"],
+            })
+        for pattern, target in self.alias_rules:
+            backends = self.routes.get(target, [])
+            healthy = [b for b in backends if self._is_healthy(b)]
+            models.append({
+                "id": f"{pattern.pattern} (regex -> {target})",
+                "object": "model",
+                "backends": len(backends),
+                "healthy": len(healthy),
+                "backend": backends[0]["api_base"] if backends else "?",
+                "backend_model": backends[0]["model"] if backends else "?",
             })
         return web.json_response({"object": "list", "data": models})
 

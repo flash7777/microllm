@@ -105,7 +105,49 @@ model_list:
       model: hosted_vllm/glm-4.7-flash
       api_base: http://0.0.0.0:8011/v1
       ...
+
+  # Alias auf eine Alias-Gruppe: teilt deren Backends (Health-State,
+  # Concurrency-Limits). Neue Backends der Gruppe werden automatisch
+  # vom Alias mitgeroutet.
+  - model_name: sonnet
+    alias_of: local
+
+  # Regex-Alias: unbekannte Modellnamen (z.B. neue Claude-Code-IDs)
+  # werden per Python-Regex erkannt und auf die Gruppe geroutet.
+  # Exakte Routen haben Vorrang; erster Treffer in Config-Reihenfolge.
+  - model_match: "^claude-"
+    alias_of: local
 ```
+
+### Alias-Gruppen (`alias_of`, `model_match`)
+
+Eine Alias-Gruppe entsteht, wenn mehrere Entries denselben `model_name`
+haben (Loadbalancing per Least-Connections). Aliase zeigen auf so eine
+Gruppe, ohne deren Backends zu duplizieren:
+
+```yaml
+model_list:
+  # Alias-Gruppe "local-ocr2" (mehrere Backends mit gleichem model_name)
+  - model_name: local-ocr2
+    litellm_params: { model: hosted_vllm/qwen38-27b, api_base: "http://10.30.10.111:8013/v1", ... }
+  - model_name: local-ocr2
+    litellm_params: { model: hosted_vllm/qwen38-27b, api_base: "http://10.30.254.81:8011/v1", ... }
+
+  # Exakter Alias: teilt die Backend-Liste der Gruppe (Health-State + Semaphore
+  # inklusive) — neue Downstreams in der Gruppe werden automatisch mitgeroutet
+  - model_name: haiku
+    alias_of: local-ocr2
+
+  # Regex-Alias: unbekannte Modellnamen (z.B. neue Claude-Code-IDs)
+  - model_match: "^claude-"
+    alias_of: local-ocr2
+```
+
+Regeln:
+- `alias_of` und `litellm_params` sind sich gegenseitig ausschließend.
+- Ziel muss eine konkrete Gruppe sein (keine Alias-Ketten).
+- Exakte Routen haben Vorrang vor `model_match` (Python-Regex, `search`).
+- Unbekanntes Ziel → Warnung + Skip (Reload crash-safe).
 
 ## OCR-Integration
 
