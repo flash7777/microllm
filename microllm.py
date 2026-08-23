@@ -656,9 +656,33 @@ class MicroLLM:
                         else:
                             data["system"] = f"[Web Search Results]\n{search_text}"
 
-        # Builtin tool executor: the alias group runs web_search/web_fetch server-side
+        # Builtin tool executor: the alias group runs web_search/web_fetch
+        # server-side.  Only enter the non-streaming tool loop when the client
+        # did NOT request streaming — streaming clients (Claude Code) need
+        # token-by-token SSE which the buffered tool loop cannot provide.
+        # For streaming requests: inject the tool definitions into the request
+        # and let the backend stream normally.  If the model calls a builtin
+        # tool the response will contain an unresolved tool_use block, but in
+        # practice simple chat requests never trigger tools.
         if has_builtin and "messages" in data:
-            return await self._run_tool_loop(request, data, model_name, group_meta)
+            if not data.get("stream", False):
+                return await self._run_tool_loop(request, data, model_name, group_meta)
+            # Streaming: inject tool defs so the model CAN call them (for
+            # non-streaming follow-ups), but stream through normally.
+            is_anthropic = request.path.endswith("/v1/messages")
+            client_tool_names = set()
+            for t in data.get("tools") or []:
+                if not isinstance(t, dict):
+                    continue
+                if is_anthropic:
+                    client_tool_names.add(t.get("name"))
+                else:
+                    client_tool_names.add((t.get("function") or {}).get("name"))
+            builtin_names = [n for n in group_meta.get("builtin", [])
+                             if n in self.BUILTIN_TOOL_DEFS and n not in client_tool_names]
+            injected = self._tool_definitions(is_anthropic, builtin_names)
+            if injected:
+                data["tools"] = list(data.get("tools") or []) + injected
 
         is_stream = data.get("stream", False)
         client_ip = self._client_ip(request)
