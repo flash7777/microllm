@@ -1644,8 +1644,20 @@ class MicroLLM:
             results[call["id"]] = await self._execute_builtin(call)
 
         # Rebuild conversation: assistant content + tool results
-        fake_resp = {"content": intercept["assistant_content"],
-                     "stop_reason": "tool_use"}
+        if is_anthropic:
+            fake_resp = {"content": intercept["assistant_content"],
+                         "stop_reason": "tool_use"}
+        else:
+            fake_resp = {"choices": [{"message": {
+                "content": intercept.get("openai_text") or None,
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"],
+                                  "arguments": json.dumps(
+                                      tc["input"], ensure_ascii=False)}}
+                    for tc in tool_calls
+                ],
+            }}]}
         data = self._append_tool_round(data, fake_resp, tool_calls, results, is_anthropic)
 
         # --- Phase 3: Follow-up rounds (non-streaming + keepalive) ---
@@ -1803,6 +1815,12 @@ class MicroLLM:
         had_client_tools = False
         stop_reason = None
 
+        # Tracking state for OpenAI tool_call interception
+        openai_text_parts = []           # accumulated text content
+        openai_tool_calls = {}           # tc index -> {id, name, arguments_parts}
+        openai_buffered_tc_events = []   # raw bytes to replay if not intercepting
+        openai_intercepting = False      # set when we intercept at finish_reason
+
         sem = self.get_backend_semaphore(
             route["api_base"], route.get("max_concurrent") or None)
         try:
@@ -1842,12 +1860,89 @@ class MicroLLM:
 
                             ev = self._parse_sse_event(event_raw)
                             if ev is None:
-                                # SSE comment or [DONE] — forward raw
+                                # SSE comment or [DONE]
+                                if openai_intercepting:
+                                    continue  # suppress [DONE] during intercept
                                 await sse_response.write(event_bytes)
                                 continue
 
+                            if openai_intercepting:
+                                continue  # suppress post-intercept chunks
+
                             if not is_anthropic:
-                                # Non-Anthropic: no interception, raw passthrough
+                                # --- OpenAI event handling ---
+                                choices = ev.get("choices", [])
+                                if not choices:
+                                    # Usage or metadata chunk — forward
+                                    await sse_response.write(event_bytes)
+                                    continue
+
+                                choice = choices[0]
+                                delta = choice.get("delta", {})
+                                finish_reason = choice.get("finish_reason")
+
+                                # Text content — forward immediately
+                                if delta.get("content") is not None:
+                                    await sse_response.write(event_bytes)
+                                    openai_text_parts.append(
+                                        delta["content"])
+                                    continue
+
+                                # Tool call deltas — buffer
+                                tc_list = delta.get("tool_calls")
+                                if tc_list:
+                                    for tc in tc_list:
+                                        idx = tc.get("index", 0)
+                                        if idx not in openai_tool_calls:
+                                            openai_tool_calls[idx] = {
+                                                "id": "",
+                                                "name": "",
+                                                "arguments_parts": []}
+                                        entry = openai_tool_calls[idx]
+                                        if tc.get("id"):
+                                            entry["id"] = tc["id"]
+                                        fn = tc.get("function") or {}
+                                        if fn.get("name"):
+                                            entry["name"] = fn["name"]
+                                        if fn.get("arguments"):
+                                            entry["arguments_parts"].append(
+                                                fn["arguments"])
+                                    openai_buffered_tc_events.append(
+                                        event_bytes)
+                                    continue
+
+                                # Finish reason
+                                if (finish_reason == "tool_calls"
+                                        and openai_tool_calls):
+                                    all_builtin = all(
+                                        tc["name"] in builtin_names
+                                        for tc in openai_tool_calls.values())
+                                    if all_builtin:
+                                        # Intercept all tool calls
+                                        for tc in openai_tool_calls.values():
+                                            raw_args = "".join(
+                                                tc["arguments_parts"])
+                                            try:
+                                                args = (json.loads(raw_args)
+                                                        if raw_args else {})
+                                            except json.JSONDecodeError:
+                                                args = {}
+                                            suppressed_calls.append({
+                                                "id": tc["id"],
+                                                "name": tc["name"],
+                                                "input": args})
+                                        openai_intercepting = True
+                                        continue
+                                    else:
+                                        # Some non-builtin — replay all
+                                        for buf in openai_buffered_tc_events:
+                                            await sse_response.write(buf)
+                                        await sse_response.write(event_bytes)
+                                        openai_tool_calls.clear()
+                                        openai_buffered_tc_events.clear()
+                                        continue
+
+                                # Everything else (role, stop, etc.)
                                 await sse_response.write(event_bytes)
                                 continue
 
@@ -2018,6 +2113,7 @@ class MicroLLM:
             "tool_calls": suppressed_calls,
             "assistant_content": assistant_content,
             "forwarded_index": forwarded_index,
+            "openai_text": "".join(openai_text_parts),
         }
 
     async def _backend_call_json(self, request, model_name, send_data):
