@@ -1423,15 +1423,15 @@ class MicroLLM:
     # --- Builtin Tool Executor (per alias group: web_search, web_fetch) ---
 
     BUILTIN_TOOL_DEFS = {
-        "web_search": (
+        "uri_search": (
             "Search the web. Returns a numbered list of results with title, URL and snippet.",
             {"type": "object", "properties": {
                 "query": {"type": "string", "description": "The search query"},
                 "max_results": {"type": "integer", "description": "Maximum number of results (default 5)"},
             }, "required": ["query"]},
         ),
-        "web_fetch": (
-            "Fetch a web page and return its content as text. Use after web_search to read a specific URL.",
+        "uri_fetch": (
+            "Fetch a web page and return its content as text. Use after uri_search to read a specific URL.",
             {"type": "object", "properties": {
                 "url": {"type": "string", "description": "Absolute URL to fetch (http/https)"},
             }, "required": ["url"]},
@@ -2165,7 +2165,7 @@ class MicroLLM:
         args = call["input"] or {}
         t0 = time.monotonic()
         try:
-            if name == "web_search":
+            if name == "uri_search":
                 query = str(args.get("query", "")).strip()
                 if not query:
                     return "Error: missing 'query' argument"
@@ -2175,7 +2175,7 @@ class MicroLLM:
                     max_results = 5
                 results = await self._web_search(query, max_results=max(1, min(max_results, 10)))
                 text = self._format_search_results(results, query)
-            elif name == "web_fetch":
+            elif name == "uri_fetch":
                 url = str(args.get("url", "")).strip()
                 if not url:
                     return "Error: missing 'url' argument"
