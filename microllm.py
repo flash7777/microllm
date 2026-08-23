@@ -1208,25 +1208,32 @@ class MicroLLM:
                 f"(PDF conversion disabled or no OCR service)]")]
 
         want_images = pdf_meta.get("images", False)
+        # Vision: scan images go straight into the chat as image blocks,
+        # the VLM reads them — Taki skips OCR (ocr=0), no text needed.
+        vision = want_images and pdf_meta.get("vision", False)
+        # describe=1 always (with images): Taki only describes EMBEDDED
+        # figures, linking them to the surrounding page text.
         text, images, _total_pages = await self._call_pdf2chat(
             pdf_b64,
             images_enabled=want_images,
-            describe=want_images and not pdf_meta.get("vision", False),
+            describe=want_images,
+            ocr=not vision,
             dpi=int(pdf_meta.get("dpi", 100)),
             max_pages=int(pdf_meta.get("max_image_pages", 8)),
         )
         blocks = []
         if text:
             blocks.append(self._text_block(f"[PDF {label}]\n\n{text}"))
-        vision = want_images and pdf_meta.get("vision", False)
         for img in images:
             if not isinstance(img, dict):
                 continue
             if vision and img.get("b64"):
                 blocks.append(self._image_block(img["b64"], img.get("mime", "image/png"), is_anthropic))
             elif img.get("description"):
+                img_kind = img.get("kind", "embedded")
+                label_kind = "Scan-Seite" if img_kind == "scan" else "Abbildung"
                 blocks.append(self._text_block(
-                    f"[Abbildung Seite {img.get('page', '?')}: {img['description']}"))
+                    f"[{label_kind} Seite {img.get('page', '?')}: {img['description']}"))
         if not blocks:
             blocks.append(self._text_block(f"[PDF {label}: no content extracted]"))
         return blocks
@@ -1241,11 +1248,14 @@ class MicroLLM:
             return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}}
         return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
-    async def _call_pdf2chat(self, pdf_base64, images_enabled, describe, dpi, max_pages):
+    async def _call_pdf2chat(self, pdf_base64, images_enabled, describe, dpi, max_pages,
+                             ocr=True):
         """Extract text (+ images) from PDF via Taki.
 
         Tries PUT {ocr_url}/tika/pdf2chat (page markers + rescued images);
         falls back to /tika/text (text only) on 404 (older Taki).
+        ocr=False: Taki skips OCR of weak pages (vision clients read the
+        scan images directly).
         Returns (text, images, total_pages).
         """
         try:
@@ -1255,6 +1265,8 @@ class MicroLLM:
         query = f"images={1 if images_enabled else 0}&dpi={dpi}&max_pages={max_pages}"
         if describe:
             query += "&describe=1"
+        if not ocr:
+            query += "&ocr=0"
         url = f"{self.ocr_url}/tika/pdf2chat?{query}"
         try:
             async with self.session.put(
