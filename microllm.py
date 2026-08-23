@@ -7,16 +7,83 @@ Drop-in replacement for LiteLLM with compatible YAML config.
 """
 
 import asyncio
+import base64
+import ipaddress
 import json
 import os
 import re
 import signal
+import socket
 import sys
 import time
 from collections import defaultdict
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin
 
 import yaml
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Convert HTML to readable plain text (skips script/style/svg/...)."""
+    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "iframe", "canvas", "head"}
+    BLOCK_TAGS = {"p", "div", "br", "li", "ul", "ol", "table", "tr", "td", "th",
+                  "section", "article", "header", "footer", "main", "nav", "aside",
+                  "blockquote", "pre", "figure", "figcaption", "form", "fieldset", "dl", "dt", "dd"}
+    HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.skip_depth = 0
+        self._link_href = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self.skip_depth += 1
+            return
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag in self.HEADING_TAGS:
+            self.parts.append("## ")
+        if tag == "a":
+            for key, val in attrs:
+                if key == "href" and val and val.lower().startswith(("http://", "https://")):
+                    self._link_href = val
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            if self.skip_depth > 0:
+                self.skip_depth -= 1
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        elif tag == "a" and self._link_href:
+            self.parts.append(f" ({self._link_href})")
+            self._link_href = None
+
+    def handle_data(self, data):
+        if self.skip_depth == 0 and data.strip():
+            self.parts.append(data)
+
+
+def _html_to_text(html):
+    """HTML -> plain text: skip scripts, block tags as newlines, keep http links."""
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    lines = [ln.rstrip() for ln in "".join(parser.parts).splitlines()]
+    result, blank = [], 0
+    for ln in lines:
+        if ln.strip():
+            result.append(re.sub(r"[ \t]+", " ", ln))
+            blank = 0
+        else:
+            blank += 1
+            if blank == 1 and result:
+                result.append("")
+    return "\n".join(result).strip()
 
 
 class MicroLLM:
@@ -34,6 +101,7 @@ class MicroLLM:
         self.config_path = config_path
         self.port = port
         self.routes = {}        # model_name -> [backend, ...]  (list for least-conn)
+        self.route_meta = {}    # model_name -> {"builtin": [...], "pdf": {...}}  (pro Alias-Gruppe)
         self.alias_rules = []   # [(compiled_regex, target_group), ...]  (model_match entries)
         self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
@@ -107,6 +175,7 @@ class MicroLLM:
             route["unhealthy_since"] = None
             route["fail_count"] = 0
             self.routes.setdefault(name, []).append(route)
+            self._apply_group_meta(name, entry)
 
         # Pass 2: alias entries — exact alias (model_name + alias_of) shares the
         # target group's backend list (health state + semaphores included);
@@ -145,6 +214,10 @@ class MicroLLM:
                     print(f"  ! alias '{name}' -> unknown group '{target}' -> skipped")
                     continue
                 self.routes[name] = self.routes[target]
+                inherited = self.route_meta.get(target)
+                if inherited is not None:
+                    self.route_meta[name] = {"builtin": list(inherited["builtin"]), "pdf": dict(inherited["pdf"])}
+                self._apply_group_meta(name, entry)
                 alias_names.add(name)
                 print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)")
 
@@ -172,6 +245,31 @@ class MicroLLM:
                     print(f"  {name:20s} -> {len(backends)} backends (least-conn):")
                     for b in backends:
                         print(f"    - {b['api_base']}")
+
+    @staticmethod
+    def _default_pdf_meta():
+        return {"enabled": True, "images": False, "vision": False, "dpi": 100, "max_image_pages": 8}
+
+    def _apply_group_meta(self, name, entry, store=None, flush=False):
+        """Merge builtin/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
+        store = store if store is not None else self.route_meta
+        if "builtin" not in entry and "pdf" not in entry:
+            return
+        if name not in store or store[name] is None:
+            store[name] = {"builtin": [], "pdf": self._default_pdf_meta()}
+        meta = store[name]
+        if "builtin" in entry:
+            builtin = entry["builtin"]
+            if isinstance(builtin, str):
+                builtin = [builtin]
+            if meta["builtin"] and meta["builtin"] != builtin:
+                print(f"  ! {name}: conflicting builtin lists, keeping {meta['builtin']}", flush=flush)
+            else:
+                meta["builtin"] = list(builtin)
+        if "pdf" in entry:
+            meta["pdf"].update(entry["pdf"])
+        if meta["builtin"]:
+            print(f"  {name:20s} builtin={meta['builtin']}  pdf={meta['pdf']}", flush=flush)
 
     def reload_config(self):
         """Hot-reload config: merge new backends into existing groups, remove stale ones.
@@ -233,6 +331,13 @@ class MicroLLM:
                 route["chat_template_kwargs"] = params["chat_template_kwargs"]
             new_routes.setdefault(name, []).append(route)
 
+        # Parse group meta (builtin/pdf, pro Alias-Gruppe)
+        new_meta = {}
+        for entry in config.get("model_list", []):
+            name = entry.get("model_name")
+            if name and ("builtin" in entry or "pdf" in entry):
+                self._apply_group_meta(name, entry, store=new_meta, flush=True)
+
         # Parse new service backends
         new_services = {}
         for entry in config.get("service_list", []):
@@ -288,6 +393,12 @@ class MicroLLM:
                 del self.routes[name]
                 print(f"  - removed route: {name}", flush=True)
 
+        # Group meta (builtin/pdf): new config is the source of truth
+        for name in list(self.route_meta):
+            if name not in new_meta:
+                del self.route_meta[name]
+        self.route_meta.update(new_meta)
+
         # Re-resolve alias routes: exact aliases share the (just merged) target
         # group's backend list; stale aliases are removed (drain-aware).
         for name, target in new_aliases.items():
@@ -299,6 +410,9 @@ class MicroLLM:
                 continue
             if target in self.routes:
                 self.routes[name] = self.routes[target]
+                inherited = self.route_meta.get(target)
+                if inherited is not None and name not in new_meta:
+                    self.route_meta[name] = {"builtin": list(inherited["builtin"]), "pdf": dict(inherited["pdf"])}
                 print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)", flush=True)
             else:
                 if name in self.routes and not any(
@@ -307,6 +421,7 @@ class MicroLLM:
                          self.backend_semaphores[b["api_base"]]._value) > 0
                         for b in self.routes[name]):
                     del self.routes[name]
+                    self.route_meta.pop(name, None)
                     print(f"  - removed alias: {name} (target {target} gone)", flush=True)
 
         # Rebuild regex alias rules
@@ -482,14 +597,38 @@ class MicroLLM:
                             "usage": {"input_tokens": 0, "output_tokens": 0},
                         })
 
-        # Intercept document blocks (PDF) -> OCR -> text, or strip if no OCR
+        # Resolve the alias group first (needed for the group meta: builtin tools, PDF)
+        model_name = data.get("model", "")
+        if model_name not in self.routes:
+            # Regex aliases (model_match): first matching rule wins
+            for pattern, target in self.alias_rules:
+                if pattern.search(model_name):
+                    print(f"  {model_name} -> group {target} (regex '{pattern.pattern}')", flush=True)
+                    model_name = target
+                    break
+            else:
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": f"Unknown model: '{model_name}'. Available: {list(self.routes.keys())}",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                    status=404,
+                )
+
+        group_meta = self.route_meta.get(model_name)
+        has_builtin = bool(group_meta and group_meta.get("builtin"))
+
+        # PDF blocks (document/input_file) -> Taki text + images, per alias group
         if "messages" in data:
-            data = await self._process_document_blocks(data)
+            data = await self._convert_pdf_blocks(data, group_meta, request.path)
 
         # Strip server-side tools that vLLM doesn't understand (web_search)
         # If web_search was requested AND we have a search engine configured,
-        # perform the search and inject results into context
-        if "tools" in data:
+        # perform the search and inject results into context.
+        # Skipped when the group has builtin tools: the tool loop takes over.
+        if "tools" in data and not has_builtin:
             has_web_search = False
             kept_tools = []
             for tool in data["tools"]:
@@ -517,24 +656,9 @@ class MicroLLM:
                         else:
                             data["system"] = f"[Web Search Results]\n{search_text}"
 
-        model_name = data.get("model", "")
-        if model_name not in self.routes:
-            # Regex aliases (model_match): first matching rule wins
-            for pattern, target in self.alias_rules:
-                if pattern.search(model_name):
-                    print(f"  {model_name} -> group {target} (regex '{pattern.pattern}')", flush=True)
-                    model_name = target
-                    break
-            else:
-                return web.json_response(
-                    {
-                        "error": {
-                            "message": f"Unknown model: '{model_name}'. Available: {list(self.routes.keys())}",
-                            "type": "invalid_request_error",
-                        }
-                    },
-                    status=404,
-                )
+        # Builtin tool executor: the alias group runs web_search/web_fetch server-side
+        if has_builtin and "messages" in data:
+            return await self._run_tool_loop(request, data, model_name, group_meta)
 
         is_stream = data.get("stream", False)
         client_ip = self._client_ip(request)
@@ -1029,43 +1153,132 @@ class MicroLLM:
         self.start_time = time.time()
         return web.json_response({"status": "reset"})
 
-    # --- OCR Integration ---
+    # --- PDF Conversion (per alias group, anthropic + openai) ---
 
-    async def _process_document_blocks(self, data):
-        """Replace type:'document' blocks with type:'text' (via OCR or fallback)."""
+    async def _convert_pdf_blocks(self, data, group_meta, path):
+        """Convert PDF blocks to text (+ image blocks) before they reach the backend.
+
+        Anthropic: content block type 'document'  (source.data = base64 PDF)
+        OpenAI:    content part  type 'input_file' (file.file_data = data URL)
+
+        Enabled per alias group via the 'pdf' meta (default: enabled, no images).
+        Without OCR service or with pdf.enabled=false a placeholder is inserted
+        (backends like vLLM cannot consume raw PDF blocks).
+        """
+        is_anthropic = path.endswith("/v1/messages")
         for msg in data.get("messages", []):
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
             new_content = []
             for block in content:
-                if (isinstance(block, dict)
-                        and block.get("type") == "document"):
-                    media_type = block.get("source", {}).get("media_type", "")
-                    pdf_b64 = block.get("source", {}).get("data", "")
-                    if pdf_b64 and self.ocr_url and "pdf" in media_type:
-                        md = await self._call_ocr(pdf_b64)
-                        new_content.append({
-                            "type": "text",
-                            "text": f"[PDF Document]\n\n{md}",
-                        })
-                    elif pdf_b64 and not self.ocr_url:
-                        # No OCR available - insert placeholder
-                        import base64
-                        size_kb = len(pdf_b64) * 3 // 4 // 1024
-                        new_content.append({
-                            "type": "text",
-                            "text": f"[Document: {media_type}, {size_kb}KB - content not extractable without OCR service]",
-                        })
-                    else:
-                        new_content.append({
-                            "type": "text",
-                            "text": "[Document: empty or unreadable]",
-                        })
-                else:
+                if not isinstance(block, dict):
                     new_content.append(block)
+                    continue
+                if is_anthropic and block.get("type") == "document":
+                    source = block.get("source", {}) or {}
+                    media_type = source.get("media_type", "")
+                    pdf_b64 = source.get("data", "")
+                    if "pdf" in media_type and pdf_b64:
+                        new_content.extend(
+                            await self._pdf_to_blocks(pdf_b64, (group_meta or {}).get("pdf"), is_anthropic))
+                        continue
+                elif not is_anthropic and block.get("type") == "input_file":
+                    file_part = block.get("file", {}) or {}
+                    file_data = file_part.get("file_data", "")
+                    if file_data.startswith("data:application/pdf"):
+                        pdf_b64 = file_data.split(",", 1)[1] if "," in file_data else ""
+                        if pdf_b64:
+                            new_content.extend(await self._pdf_to_blocks(
+                                pdf_b64, (group_meta or {}).get("pdf"), is_anthropic,
+                                file_part.get("filename", "")))
+                            continue
+                new_content.append(block)
             msg["content"] = new_content
         return data
+
+    async def _pdf_to_blocks(self, pdf_b64, pdf_meta, is_anthropic, filename=""):
+        """Convert one base64 PDF to text + image blocks (format dependent)."""
+        pdf_meta = pdf_meta or self._default_pdf_meta()
+        label = filename or "document"
+        if not self.ocr_url or not pdf_meta.get("enabled", True):
+            size_kb = len(pdf_b64) * 3 // 4 // 1024
+            return [self._text_block(
+                f"[PDF {label}: {size_kb}KB - content not extractable "
+                f"(PDF conversion disabled or no OCR service)]")]
+
+        want_images = pdf_meta.get("images", False)
+        text, images, _total_pages = await self._call_pdf2chat(
+            pdf_b64,
+            images_enabled=want_images,
+            describe=want_images and not pdf_meta.get("vision", False),
+            dpi=int(pdf_meta.get("dpi", 100)),
+            max_pages=int(pdf_meta.get("max_image_pages", 8)),
+        )
+        blocks = []
+        if text:
+            blocks.append(self._text_block(f"[PDF {label}]\n\n{text}"))
+        vision = want_images and pdf_meta.get("vision", False)
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            if vision and img.get("b64"):
+                blocks.append(self._image_block(img["b64"], img.get("mime", "image/png"), is_anthropic))
+            elif img.get("description"):
+                blocks.append(self._text_block(
+                    f"[Abbildung Seite {img.get('page', '?')}: {img['description']}"))
+        if not blocks:
+            blocks.append(self._text_block(f"[PDF {label}: no content extracted]"))
+        return blocks
+
+    @staticmethod
+    def _text_block(text):
+        return {"type": "text", "text": text}
+
+    @staticmethod
+    def _image_block(b64, mime, is_anthropic):
+        if is_anthropic:
+            return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}}
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+    async def _call_pdf2chat(self, pdf_base64, images_enabled, describe, dpi, max_pages):
+        """Extract text (+ images) from PDF via Taki.
+
+        Tries PUT {ocr_url}/tika/pdf2chat (page markers + rescued images);
+        falls back to /tika/text (text only) on 404 (older Taki).
+        Returns (text, images, total_pages).
+        """
+        try:
+            pdf_bytes = base64.b64decode(pdf_base64)
+        except Exception as e:
+            return f"[PDF decode error: {e}]", [], 0
+        query = f"images={1 if images_enabled else 0}&dpi={dpi}&max_pages={max_pages}"
+        if describe:
+            query += "&describe=1"
+        url = f"{self.ocr_url}/tika/pdf2chat?{query}"
+        try:
+            async with self.session.put(
+                url, data=pdf_bytes,
+                headers={"Content-Type": "application/pdf", "Accept": "application/json"},
+                timeout=ClientTimeout(total=600),
+            ) as resp:
+                if resp.status == 404:
+                    print("  Tika: /tika/pdf2chat missing, falling back to /tika/text", flush=True)
+                    return await self._call_ocr(pdf_base64), [], 0
+                if resp.status == 200:
+                    result = await resp.json()
+                    text = (result.get("text") or "").strip()
+                    images = result.get("images") or []
+                    total_pages = result.get("pages", 0)
+                    print(f"  Tika pdf2chat: {len(text)} chars, {len(images)} images, "
+                          f"{total_pages} pages", flush=True)
+                    return text, images, total_pages
+                body = await resp.text()
+                print(f"  Tika pdf2chat error {resp.status}: {body[:200]}", flush=True)
+                return f"[Tika error: {resp.status}]", [], 0
+        except Exception as e:
+            print(f"  Tika pdf2chat exception: {e}", flush=True)
+            return f"[Tika unavailable: {e}]", [], 0
 
     async def _call_ocr(self, pdf_base64):
         """Extract text from PDF via Tika (PUT /tika/text with PDF body)."""
@@ -1188,6 +1401,435 @@ class MicroLLM:
                 lines.append(f"   {r['snippet']}")
             lines.append("")
         return "\n".join(lines)
+
+    # --- Builtin Tool Executor (per alias group: web_search, web_fetch) ---
+
+    BUILTIN_TOOL_DEFS = {
+        "web_search": (
+            "Search the web. Returns a numbered list of results with title, URL and snippet.",
+            {"type": "object", "properties": {
+                "query": {"type": "string", "description": "The search query"},
+                "max_results": {"type": "integer", "description": "Maximum number of results (default 5)"},
+            }, "required": ["query"]},
+        ),
+        "web_fetch": (
+            "Fetch a web page and return its content as text. Use after web_search to read a specific URL.",
+            {"type": "object", "properties": {
+                "url": {"type": "string", "description": "Absolute URL to fetch (http/https)"},
+            }, "required": ["url"]},
+        ),
+    }
+
+    WEB_FETCH_MAX_REDIRECTS = 3
+    WEB_FETCH_TIMEOUT = 15          # seconds per hop
+    WEB_FETCH_MAX_BYTES = 500 * 1024
+    WEB_FETCH_MAX_CHARS = 30000
+
+    def _tool_definitions(self, is_anthropic, names):
+        """Tool definitions in the wire format of the given API."""
+        defs = []
+        for name in names:
+            if name not in self.BUILTIN_TOOL_DEFS:
+                continue
+            description, schema = self.BUILTIN_TOOL_DEFS[name]
+            if is_anthropic:
+                defs.append({"name": name, "description": description, "input_schema": schema})
+            else:
+                defs.append({
+                    "type": "function",
+                    "function": {"name": name, "description": description, "parameters": schema},
+                })
+        return defs
+
+    async def _run_tool_loop(self, request, data, model_name, group_meta):
+        """Execute builtin tools (web_search/web_fetch) server-side in a loop.
+
+        LLM APIs have no session, so per request: inject the tool definitions,
+        call the backend non-streaming, execute the tool calls microllm
+        injected itself, append the results to the conversation, repeat until
+        the model answers or max rounds is reached (last round runs without
+        tools to force a final answer). Client-declared tools are passed
+        through untouched and NOT executed: if the model calls one, the raw
+        response goes back to the client. If the client wanted a stream, the
+        buffered final answer is delivered as a synthesized SSE stream.
+        """
+        is_anthropic = request.path.endswith("/v1/messages")
+        is_stream = data.get("stream", False)
+        max_rounds = int(group_meta.get("max_tool_rounds", 3))
+
+        # Anthropic server tools (web_search_*) would break vLLM: strip them
+        if "tools" in data and is_anthropic:
+            data["tools"] = [t for t in data["tools"]
+                             if not (isinstance(t, dict) and str(t.get("type", "")).startswith("web_search"))]
+            if not data["tools"]:
+                del data["tools"]
+
+        # Don't inject tools the client already declared itself
+        client_tool_names = set()
+        for t in data.get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            if is_anthropic:
+                client_tool_names.add(t.get("name"))
+            else:
+                client_tool_names.add((t.get("function") or {}).get("name"))
+        builtin_names = [n for n in group_meta.get("builtin", [])
+                         if n in self.BUILTIN_TOOL_DEFS and n not in client_tool_names]
+        injected = self._tool_definitions(is_anthropic, builtin_names)
+        if injected:
+            data["tools"] = list(data.get("tools") or []) + injected
+
+        client_ip = self._client_ip(request)
+        t0 = time.monotonic()
+        self.stats[model_name]["requests"] += 1
+        self.chatlog_seq += 1
+        req_seq = self.chatlog_seq
+
+        final_resp = None
+        last_error = None
+        rounds_done = 0
+
+        for round_no in range(1, max_rounds + 1):
+            # Last round without tools -> force a final answer
+            send_data = dict(data)
+            send_data["stream"] = False
+            if round_no < max_rounds:
+                send_data["tools"] = list(data.get("tools") or [])
+            else:
+                send_data.pop("tools", None)
+
+            self.chatlog_seq += 1
+            round_seq = self.chatlog_seq
+            self._chatlog_write(round_seq, f"req_r{round_no}", send_data, model_name)
+
+            try:
+                resp_json = await self._backend_call_json(request, model_name, send_data)
+            except Exception as e:
+                last_error = e
+                break
+
+            self._chatlog_write(round_seq, f"resp_r{round_no}", resp_json, model_name)
+            rounds_done = round_no
+
+            calls, had_other = self._extract_builtin_tool_calls(resp_json, is_anthropic, builtin_names)
+            if not calls or had_other or round_no == max_rounds:
+                # Final answer (last round is final even if the model still
+                # tries to call tools) - or a client tool call the client must
+                # handle itself
+                final_resp = resp_json
+                break
+
+            print(f"  {model_name}: builtin tools round {round_no}/{max_rounds}: "
+                  f"{[c['name'] for c in calls]}", flush=True)
+            results = {}
+            for call in calls:
+                results[call["id"]] = await self._execute_builtin(call)
+            data = self._append_tool_round(data, resp_json, calls, results, is_anthropic)
+
+        self.stats[model_name]["total_gen_s"] += time.monotonic() - t0
+
+        if final_resp is None:
+            self.stats[model_name]["errors"] += 1
+            return web.json_response(
+                {"error": {"message": f"Tool loop failed after {rounds_done} rounds: {last_error}",
+                           "type": "proxy_error"}},
+                status=502,
+            )
+
+        self._log(model_name, f"tools:{rounds_done}", time.monotonic() - t0, client_ip)
+        return await self._deliver_tool_loop_response(
+            request, final_resp, model_name, is_stream, is_anthropic, req_seq)
+
+    async def _backend_call_json(self, request, model_name, send_data):
+        """Non-streaming backend call with failover. Returns the parsed JSON body."""
+        backends = self.routes[model_name]
+        last_error = None
+        for attempt in range(len(backends)):
+            route = self.pick_backend(model_name)
+            if not route:
+                break
+            s = dict(send_data)
+            s["model"] = route["model"]
+            if "chat_template_kwargs" in route and "chat_template_kwargs" not in s:
+                s["chat_template_kwargs"] = route["chat_template_kwargs"]
+            body_out = json.dumps(s).encode()
+            url = f"{route['api_base']}{request.path}"
+            qs = request.query_string
+            if qs:
+                url += f"?{qs}"
+            headers = {}
+            for key, val in request.headers.items():
+                if key.lower() not in ("host", "content-length", "transfer-encoding"):
+                    headers[key] = val
+            headers["Content-Length"] = str(len(body_out))
+            try:
+                sem = self.get_backend_semaphore(route["api_base"], route.get("max_concurrent") or None)
+                async with sem:
+                    async with self.session.post(url, data=body_out, headers=headers) as resp:
+                        if resp.status >= 400:
+                            body = await resp.text()
+                            self.mark_failed(model_name, route)
+                            last_error = f"HTTP {resp.status} from {route['api_base']}: {body[:200]}"
+                            print(f"  {model_name}: {last_error}, "
+                                  f"trying next ({attempt+1}/{len(backends)})", flush=True)
+                            continue
+                        self.mark_success(model_name, route)
+                        resp_json = await resp.json(content_type=None)
+                        usage = resp_json.get("usage") or {}
+                        tok_in = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0
+                        tok_out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0
+                        if tok_in:
+                            self.stats[model_name]["tokens_in"] += tok_in
+                        if tok_out:
+                            self.stats[model_name]["tokens_out"] += tok_out
+                        return resp_json
+            except Exception as e:
+                self.mark_failed(model_name, route)
+                last_error = e
+                if attempt + 1 < len(backends):
+                    print(f"  {model_name}: backend {route['api_base']} failed ({e}), "
+                          f"trying next ({attempt+1}/{len(backends)})", flush=True)
+        raise RuntimeError(f"All backends failed: {last_error}")
+
+    def _extract_builtin_tool_calls(self, resp_json, is_anthropic, builtin_names):
+        """Extract the builtin tool calls from a backend response.
+
+        Returns (calls, had_other): calls = [{"id", "name", "input"}, ...] for
+        the builtin tools, had_other = model also called tools we did not
+        inject (client tools the client must handle itself).
+        """
+        calls, had_other = [], False
+        if is_anthropic:
+            for block in resp_json.get("content", []):
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                if name in builtin_names:
+                    calls.append({"id": block.get("id"), "name": name,
+                                  "input": block.get("input", {}) or {}})
+                else:
+                    had_other = True
+        else:
+            for choice in resp_json.get("choices", []):
+                for tc in (choice.get("message", {}) or {}).get("tool_calls", []) or []:
+                    fn = tc.get("function", {}) or {}
+                    name = fn.get("name")
+                    try:
+                        args = json.loads(fn.get("arguments", "") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    if name in builtin_names:
+                        calls.append({"id": tc.get("id"), "name": name, "input": args})
+                    else:
+                        had_other = True
+        return calls, had_other
+
+    def _append_tool_round(self, data, resp_json, calls, results, is_anthropic):
+        """Append the assistant tool round + tool results to the conversation."""
+        if is_anthropic:
+            content = [b for b in resp_json.get("content", [])
+                       if isinstance(b, dict) and b.get("type") in ("text", "tool_use")]
+            data["messages"].append({"role": "assistant", "content": content})
+            data["messages"].append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": c["id"],
+                 "content": results.get(c["id"], "")}
+                for c in calls
+            ]})
+        else:
+            message = (resp_json.get("choices") or [{}])[0].get("message", {}) or {}
+            assistant_msg = {"role": "assistant", "content": message.get("content")}
+            assistant_msg["tool_calls"] = [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": json.dumps(c["input"], ensure_ascii=False)}}
+                for c in calls
+            ]
+            data["messages"].append(assistant_msg)
+            for c in calls:
+                data["messages"].append({"role": "tool", "tool_call_id": c["id"],
+                                         "content": results.get(c["id"], "")})
+        return data
+
+    async def _execute_builtin(self, call):
+        """Execute one builtin tool. Returns the text result for the model."""
+        name = call["name"]
+        args = call["input"] or {}
+        t0 = time.monotonic()
+        try:
+            if name == "web_search":
+                query = str(args.get("query", "")).strip()
+                if not query:
+                    return "Error: missing 'query' argument"
+                try:
+                    max_results = int(args.get("max_results", 5))
+                except (TypeError, ValueError):
+                    max_results = 5
+                results = await self._web_search(query, max_results=max(1, min(max_results, 10)))
+                text = self._format_search_results(results, query)
+            elif name == "web_fetch":
+                url = str(args.get("url", "")).strip()
+                if not url:
+                    return "Error: missing 'url' argument"
+                text = await self._web_fetch(url)
+            else:
+                return f"Error: unknown builtin tool '{name}'"
+        except Exception as e:
+            text = f"Error: {e}"
+        print(f"  builtin {name}: {time.monotonic() - t0:.1f}s, {len(text)} chars", flush=True)
+        return text
+
+    @staticmethod
+    def _url_is_safe(url):
+        """SSRF guard: only public http(s) URLs, no private/loopback addresses."""
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            return False
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+        return True
+
+    async def _web_fetch(self, url):
+        """Fetch a URL (SSRF-guarded, redirects re-checked) and return its text."""
+        current = url
+        for _ in range(self.WEB_FETCH_MAX_REDIRECTS + 1):
+            if not self._url_is_safe(current):
+                return (f"Error: URL not allowed (only public http/https URLs, "
+                        f"no private/loopback addresses): {current}")
+            headers = {
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+                "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8",
+            }
+            try:
+                async with self.session.get(
+                    current, headers=headers, allow_redirects=False,
+                    timeout=ClientTimeout(total=self.WEB_FETCH_TIMEOUT),
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location", "")
+                        if not location:
+                            return f"Error: redirect without Location (HTTP {resp.status})"
+                        current = urljoin(current, location)
+                        continue
+                    if resp.status >= 400:
+                        return f"Error: HTTP {resp.status} for {current}"
+                    content_type = resp.headers.get("content-type", "")
+                    if "pdf" in content_type or "octet-stream" in content_type:
+                        return f"Error: {current} is not a text page (content-type: {content_type})"
+                    chunk = await resp.content.read(self.WEB_FETCH_MAX_BYTES + 1)
+            except asyncio.TimeoutError:
+                return f"Error: timeout fetching {current} (> {self.WEB_FETCH_TIMEOUT}s)"
+            except Exception as e:
+                return f"Error fetching {current}: {e}"
+            if len(chunk) > self.WEB_FETCH_MAX_BYTES:
+                return f"Error: page too large (> {self.WEB_FETCH_MAX_BYTES // 1024}KB): {current}"
+            text = chunk.decode("utf-8", errors="replace")
+            if "html" in content_type:
+                text = _html_to_text(text)
+            if len(text) > self.WEB_FETCH_MAX_CHARS:
+                text = text[:self.WEB_FETCH_MAX_CHARS] + "\n[... truncated ...]"
+            return f"Content of {url}:\n\n{text}"
+        return f"Error: too many redirects for {url}"
+
+    async def _deliver_tool_loop_response(self, request, final_resp, model_name,
+                                          is_stream, is_anthropic, req_seq):
+        """Deliver the final tool-loop answer (JSON, or synthesized SSE if the client wanted a stream)."""
+        if self.chatlog_dir:
+            self._chatlog_write(req_seq, "resp", final_resp, model_name)
+        if not is_stream:
+            response = web.json_response(final_resp)
+            response.headers["X-Backend"] = "tool-loop"
+            return response
+
+        response = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+        )
+        response.enable_chunked_encoding()
+        await response.prepare(request)
+        model = final_resp.get("model", model_name)
+        try:
+            if is_anthropic:
+                msg_id = final_resp.get("id", f"msg_toolloop_{int(time.time())}")
+                usage = final_resp.get("usage", {}) or {}
+                await self._sse_write(response, "message_start", {
+                    "type": "message_start",
+                    "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [],
+                                "model": model, "stop_reason": None, "stop_sequence": None,
+                                "usage": {"input_tokens": usage.get("input_tokens", 0),
+                                          "output_tokens": 0}},
+                })
+                index = 0
+                for block in final_resp.get("content", []):
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    await self._sse_write(response, "content_block_start", {
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "text", "text": ""}})
+                    await self._sse_write(response, "content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                    await self._sse_write(response, "content_block_stop", {
+                        "type": "content_block_stop", "index": index})
+                    index += 1
+                await self._sse_write(response, "message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": final_resp.get("stop_reason", "end_turn"),
+                              "stop_sequence": None},
+                    "usage": {"output_tokens": usage.get("output_tokens", 0)},
+                })
+                await self._sse_write(response, "message_stop", {"type": "message_stop"})
+            else:
+                choice = (final_resp.get("choices") or [{}])[0]
+                message = choice.get("message", {}) or {}
+                text = message.get("content") or ""
+                chunk_id = f"chatcmpl_toolloop_{int(time.time())}"
+                created = int(time.time())
+                base = {"id": chunk_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model}
+                await self._sse_write(response, None, {
+                    **base, "choices": [{"index": 0,
+                                         "delta": {"role": "assistant", "content": ""},
+                                         "finish_reason": None}]})
+                if text:
+                    await self._sse_write(response, None, {
+                        **base, "choices": [{"index": 0, "delta": {"content": text},
+                                             "finish_reason": None}]})
+                await self._sse_write(response, None, {
+                    **base, "choices": [{"index": 0, "delta": {},
+                                         "finish_reason": choice.get("finish_reason") or "stop"}]})
+                usage = final_resp.get("usage")
+                if usage:
+                    await self._sse_write(response, None, {**base, "choices": [], "usage": usage})
+                await response.write(b"data: [DONE]\n\n")
+        except (ConnectionResetError, ConnectionError):
+            pass  # client disconnected
+        finally:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+    @staticmethod
+    async def _sse_write(response, event, payload):
+        if event:
+            line = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        else:
+            line = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        await response.write(line.encode())
 
     # --- Chatlog ---
 

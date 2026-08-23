@@ -1,0 +1,29 @@
+# Test-Konfiguration für tests/test_toolloop.py
+# Ports sind Test-Ports auf 127.0.0.1 (Mocks laufen in-prozess).
+
+general_settings:
+  port: 18123
+  ocr_url: http://127.0.0.1:18190
+  web_search_url: http://127.0.0.1:18191
+  chatlog_dir: /tmp/microllm-test-work/chatlog
+
+model_list:
+  - model_name: testgroup
+    builtin: [web_search, web_fetch]
+    pdf:
+      enabled: true
+      images: true
+      vision: true
+      dpi: 100
+      max_image_pages: 8
+    litellm_params:
+      model: fake-model
+      api_base: http://127.0.0.1:18192/v1
+
+  - model_name: testalias
+    alias_of: testgroup
+
+  - model_name: plain
+    litellm_params:
+      model: fake-model
+      api_base: http://127.0.0.1:18192/v1
