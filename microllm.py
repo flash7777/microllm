@@ -1497,6 +1497,14 @@ class MicroLLM:
         self.chatlog_seq += 1
         req_seq = self.chatlog_seq
 
+        # Prepare SSE response early so we can send keepalives during backend calls
+        sse_response = None
+        if is_stream:
+            sse_response = web.StreamResponse(
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+            sse_response.enable_chunked_encoding()
+            await sse_response.prepare(request)
+
         final_resp = None
         last_error = None
         rounds_done = 0
@@ -1515,7 +1523,8 @@ class MicroLLM:
             self._chatlog_write(round_seq, f"req_r{round_no}", send_data, model_name)
 
             try:
-                resp_json = await self._backend_call_json(request, model_name, send_data)
+                resp_json = await self._tool_loop_backend_call(
+                    request, model_name, send_data, sse_response)
             except Exception as e:
                 last_error = e
                 break
@@ -1542,15 +1551,21 @@ class MicroLLM:
 
         if final_resp is None:
             self.stats[model_name]["errors"] += 1
-            return web.json_response(
-                {"error": {"message": f"Tool loop failed after {rounds_done} rounds: {last_error}",
-                           "type": "proxy_error"}},
-                status=502,
-            )
+            error_body = {"error": {"message": f"Tool loop failed after {rounds_done} rounds: {last_error}",
+                                    "type": "proxy_error"}}
+            if sse_response is not None:
+                # SSE already prepared — send error as SSE event, then close
+                try:
+                    await self._sse_write(sse_response, "error", error_body)
+                    await sse_response.write_eof()
+                except Exception:
+                    pass
+                return sse_response
+            return web.json_response(error_body, status=502)
 
         self._log(model_name, f"tools:{rounds_done}", time.monotonic() - t0, client_ip)
         return await self._deliver_tool_loop_response(
-            request, final_resp, model_name, is_stream, is_anthropic, req_seq)
+            request, final_resp, model_name, is_stream, is_anthropic, req_seq, sse_response)
 
     async def _backend_call_json(self, request, model_name, send_data):
         """Non-streaming backend call with failover. Returns the parsed JSON body."""
@@ -1602,6 +1617,36 @@ class MicroLLM:
                     print(f"  {model_name}: backend {route['api_base']} failed ({e}), "
                           f"trying next ({attempt+1}/{len(backends)})", flush=True)
         raise RuntimeError(f"All backends failed: {last_error}")
+
+    async def _tool_loop_backend_call(self, request, model_name, send_data, sse_response):
+        """Backend call with SSE keepalive comments sent to the client during wait."""
+        if sse_response is None:
+            return await self._backend_call_json(request, model_name, send_data)
+
+        result_holder = [None, None]  # [result, exception]
+
+        async def do_call():
+            try:
+                result_holder[0] = await self._backend_call_json(request, model_name, send_data)
+            except Exception as exc:
+                result_holder[1] = exc
+
+        task = asyncio.create_task(do_call())
+        keepalive_count = 0
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=self.KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                keepalive_count += 1
+                try:
+                    await sse_response.write(f": keepalive {keepalive_count}\n\n".encode())
+                except (ConnectionResetError, ConnectionError):
+                    break
+
+        await task  # propagate CancelledError if any
+        if result_holder[1] is not None:
+            raise result_holder[1]
+        return result_holder[0]
 
     def _extract_builtin_tool_calls(self, resp_json, is_anthropic, builtin_names):
         """Extract the builtin tool calls from a backend response.
@@ -1757,7 +1802,8 @@ class MicroLLM:
         return f"Error: too many redirects for {url}"
 
     async def _deliver_tool_loop_response(self, request, final_resp, model_name,
-                                          is_stream, is_anthropic, req_seq):
+                                          is_stream, is_anthropic, req_seq,
+                                          sse_response=None):
         """Deliver the final tool-loop answer (JSON, or synthesized SSE if the client wanted a stream)."""
         if self.chatlog_dir:
             self._chatlog_write(req_seq, "resp", final_resp, model_name)
@@ -1766,11 +1812,16 @@ class MicroLLM:
             response.headers["X-Backend"] = "tool-loop"
             return response
 
-        response = web.StreamResponse(
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
-        )
-        response.enable_chunked_encoding()
-        await response.prepare(request)
+        # Re-use the pre-prepared SSE response (keepalives already flowing),
+        # or create a new one if none was passed.
+        if sse_response is not None:
+            response = sse_response
+        else:
+            response = web.StreamResponse(
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            response.enable_chunked_encoding()
+            await response.prepare(request)
         model = final_resp.get("model", model_name)
         try:
             if is_anthropic:
@@ -1785,17 +1836,30 @@ class MicroLLM:
                 })
                 index = 0
                 for block in final_resp.get("content", []):
-                    if not isinstance(block, dict) or block.get("type") != "text":
+                    if not isinstance(block, dict):
                         continue
-                    await self._sse_write(response, "content_block_start", {
-                        "type": "content_block_start", "index": index,
-                        "content_block": {"type": "text", "text": ""}})
-                    await self._sse_write(response, "content_block_delta", {
-                        "type": "content_block_delta", "index": index,
-                        "delta": {"type": "text_delta", "text": block.get("text", "")}})
-                    await self._sse_write(response, "content_block_stop", {
-                        "type": "content_block_stop", "index": index})
-                    index += 1
+                    block_type = block.get("type")
+                    if block_type == "thinking":
+                        await self._sse_write(response, "content_block_start", {
+                            "type": "content_block_start", "index": index,
+                            "content_block": {"type": "thinking", "thinking": ""}})
+                        await self._sse_write(response, "content_block_delta", {
+                            "type": "content_block_delta", "index": index,
+                            "delta": {"type": "thinking_delta",
+                                      "thinking": block.get("thinking", "")}})
+                        await self._sse_write(response, "content_block_stop", {
+                            "type": "content_block_stop", "index": index})
+                        index += 1
+                    elif block_type == "text":
+                        await self._sse_write(response, "content_block_start", {
+                            "type": "content_block_start", "index": index,
+                            "content_block": {"type": "text", "text": ""}})
+                        await self._sse_write(response, "content_block_delta", {
+                            "type": "content_block_delta", "index": index,
+                            "delta": {"type": "text_delta", "text": block.get("text", "")}})
+                        await self._sse_write(response, "content_block_stop", {
+                            "type": "content_block_stop", "index": index})
+                        index += 1
                 await self._sse_write(response, "message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": final_resp.get("stop_reason", "end_turn"),
