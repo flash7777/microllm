@@ -657,32 +657,14 @@ class MicroLLM:
                             data["system"] = f"[Web Search Results]\n{search_text}"
 
         # Builtin tool executor: the alias group runs web_search/web_fetch
-        # server-side.  Only enter the non-streaming tool loop when the client
-        # did NOT request streaming — streaming clients (Claude Code) need
-        # token-by-token SSE which the buffered tool loop cannot provide.
-        # For streaming requests: inject the tool definitions into the request
-        # and let the backend stream normally.  If the model calls a builtin
-        # tool the response will contain an unresolved tool_use block, but in
-        # practice simple chat requests never trigger tools.
+        # server-side.  Streaming clients get a streaming-first tool loop
+        # (passthrough with tool_use interception), non-streaming clients
+        # get the original buffered tool loop.
         if has_builtin and "messages" in data:
-            if not data.get("stream", False):
-                return await self._run_tool_loop(request, data, model_name, group_meta)
-            # Streaming: inject tool defs so the model CAN call them (for
-            # non-streaming follow-ups), but stream through normally.
-            is_anthropic = request.path.endswith("/v1/messages")
-            client_tool_names = set()
-            for t in data.get("tools") or []:
-                if not isinstance(t, dict):
-                    continue
-                if is_anthropic:
-                    client_tool_names.add(t.get("name"))
-                else:
-                    client_tool_names.add((t.get("function") or {}).get("name"))
-            builtin_names = [n for n in group_meta.get("builtin", [])
-                             if n in self.BUILTIN_TOOL_DEFS and n not in client_tool_names]
-            injected = self._tool_definitions(is_anthropic, builtin_names)
-            if injected:
-                data["tools"] = list(data.get("tools") or []) + injected
+            if data.get("stream", False):
+                return await self._run_streaming_tool_loop(
+                    request, data, model_name, group_meta)
+            return await self._run_tool_loop(request, data, model_name, group_meta)
 
         is_stream = data.get("stream", False)
         client_ip = self._client_ip(request)
@@ -1590,6 +1572,453 @@ class MicroLLM:
         self._log(model_name, f"tools:{rounds_done}", time.monotonic() - t0, client_ip)
         return await self._deliver_tool_loop_response(
             request, final_resp, model_name, is_stream, is_anthropic, req_seq, sse_response)
+
+    # ------------------------------------------------------------------
+    # Streaming Tool Loop: first round streams through with tool_use
+    # interception, follow-up rounds are buffered with keepalive.
+    # ------------------------------------------------------------------
+
+    async def _run_streaming_tool_loop(self, request, data, model_name, group_meta):
+        """Streaming-aware tool loop: first round streams token-by-token,
+        builtin tool_use blocks are intercepted and executed server-side,
+        follow-up rounds are buffered (with keepalive on the open SSE stream).
+        If the model calls no builtin tools (99% of requests), this is pure
+        streaming passthrough with zero buffering overhead.
+        """
+        is_anthropic = request.path.endswith("/v1/messages")
+        max_rounds = int(group_meta.get("max_tool_rounds", 3))
+
+        # Strip Anthropic server-side tools (web_search_* type) that vLLM ignores
+        if "tools" in data and is_anthropic:
+            data["tools"] = [t for t in data["tools"]
+                             if not (isinstance(t, dict)
+                                     and str(t.get("type", "")).startswith("web_search"))]
+            if not data["tools"]:
+                del data["tools"]
+
+        # Determine which builtin tools to inject (skip client-declared ones)
+        client_tool_names = set()
+        for t in data.get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            if is_anthropic:
+                client_tool_names.add(t.get("name"))
+            else:
+                client_tool_names.add((t.get("function") or {}).get("name"))
+        builtin_names = [n for n in group_meta.get("builtin", [])
+                         if n in self.BUILTIN_TOOL_DEFS and n not in client_tool_names]
+        injected = self._tool_definitions(is_anthropic, builtin_names)
+        if injected:
+            data["tools"] = list(data.get("tools") or []) + injected
+
+        client_ip = self._client_ip(request)
+        t0 = time.monotonic()
+        self.stats[model_name]["requests"] += 1
+        self.chatlog_seq += 1
+        req_seq = self.chatlog_seq
+
+        # Prepare SSE response early (client sees headers immediately)
+        sse_response = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                     "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        sse_response.enable_chunked_encoding()
+        await sse_response.prepare(request)
+
+        # --- Phase 1: Stream first round, intercept builtin tool_use ---
+        intercept = await self._stream_with_tool_intercept(
+            request, data, model_name, sse_response, builtin_names, is_anthropic)
+
+        if intercept is None:
+            # No builtin tool calls — pure streaming passthrough completed
+            elapsed = time.monotonic() - t0
+            self.stats[model_name]["total_gen_s"] += elapsed
+            self._log(model_name, "stream", elapsed, client_ip)
+            return sse_response
+
+        # --- Phase 2: Execute intercepted builtin tools ---
+        tool_calls = intercept["tool_calls"]
+        print(f"  {model_name}: streaming tool intercept: "
+              f"{[c['name'] for c in tool_calls]}", flush=True)
+        results = {}
+        for call in tool_calls:
+            results[call["id"]] = await self._execute_builtin(call)
+
+        # Rebuild conversation: assistant content + tool results
+        fake_resp = {"content": intercept["assistant_content"],
+                     "stop_reason": "tool_use"}
+        data = self._append_tool_round(data, fake_resp, tool_calls, results, is_anthropic)
+
+        # --- Phase 3: Follow-up rounds (non-streaming + keepalive) ---
+        rounds_done = 1
+        final_resp = None
+        last_error = None
+
+        for round_no in range(2, max_rounds + 1):
+            send_data = dict(data)
+            send_data["stream"] = False
+            if round_no < max_rounds:
+                send_data["tools"] = list(data.get("tools") or [])
+            else:
+                send_data.pop("tools", None)
+
+            try:
+                resp_json = await self._tool_loop_backend_call(
+                    request, model_name, send_data, sse_response)
+            except Exception as exc:
+                last_error = exc
+                break
+
+            rounds_done = round_no
+            calls, had_other = self._extract_builtin_tool_calls(
+                resp_json, is_anthropic, builtin_names)
+            if not calls or had_other or round_no == max_rounds:
+                final_resp = resp_json
+                break
+
+            print(f"  {model_name}: builtin tools round {round_no}/{max_rounds}: "
+                  f"{[c['name'] for c in calls]}", flush=True)
+            results = {}
+            for call in calls:
+                results[call["id"]] = await self._execute_builtin(call)
+            data = self._append_tool_round(data, resp_json, calls, results, is_anthropic)
+
+        elapsed = time.monotonic() - t0
+        self.stats[model_name]["total_gen_s"] += elapsed
+
+        if final_resp is None:
+            try:
+                await self._sse_write(sse_response, "error", {
+                    "error": {"message": f"Tool loop failed: {last_error}",
+                              "type": "proxy_error"}})
+                await sse_response.write_eof()
+            except Exception:
+                pass
+            self._log(model_name, f"str+tools:{rounds_done}:err", elapsed, client_ip)
+            return sse_response
+
+        # --- Phase 4: Emit follow-up answer on the existing SSE stream ---
+        next_index = intercept["forwarded_index"]
+        try:
+            if is_anthropic:
+                for block in final_resp.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "thinking":
+                        await self._sse_write(sse_response, "content_block_start", {
+                            "type": "content_block_start", "index": next_index,
+                            "content_block": {"type": "thinking", "thinking": ""}})
+                        await self._sse_write(sse_response, "content_block_delta", {
+                            "type": "content_block_delta", "index": next_index,
+                            "delta": {"type": "thinking_delta",
+                                      "thinking": block.get("thinking", "")}})
+                        await self._sse_write(sse_response, "content_block_stop", {
+                            "type": "content_block_stop", "index": next_index})
+                        next_index += 1
+                    elif block_type == "text":
+                        await self._sse_write(sse_response, "content_block_start", {
+                            "type": "content_block_start", "index": next_index,
+                            "content_block": {"type": "text", "text": ""}})
+                        await self._sse_write(sse_response, "content_block_delta", {
+                            "type": "content_block_delta", "index": next_index,
+                            "delta": {"type": "text_delta",
+                                      "text": block.get("text", "")}})
+                        await self._sse_write(sse_response, "content_block_stop", {
+                            "type": "content_block_stop", "index": next_index})
+                        next_index += 1
+                usage = final_resp.get("usage", {}) or {}
+                await self._sse_write(sse_response, "message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": final_resp.get("stop_reason", "end_turn"),
+                              "stop_sequence": None},
+                    "usage": {"output_tokens": usage.get("output_tokens", 0)}})
+                await self._sse_write(sse_response, "message_stop", {"type": "message_stop"})
+            else:
+                # OpenAI format: synthesize final chunks
+                choice = (final_resp.get("choices") or [{}])[0]
+                message = choice.get("message", {}) or {}
+                text = message.get("content") or ""
+                chunk_id = f"chatcmpl_stl_{int(time.time())}"
+                created = int(time.time())
+                model = final_resp.get("model", model_name)
+                base = {"id": chunk_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model}
+                if text:
+                    await self._sse_write(sse_response, None, {
+                        **base, "choices": [{"index": 0, "delta": {"content": text},
+                                             "finish_reason": None}]})
+                await self._sse_write(sse_response, None, {
+                    **base, "choices": [{"index": 0, "delta": {},
+                                         "finish_reason": choice.get("finish_reason") or "stop"}]})
+                await sse_response.write(b"data: [DONE]\n\n")
+        except (ConnectionResetError, ConnectionError):
+            pass
+        finally:
+            try:
+                await sse_response.write_eof()
+            except Exception:
+                pass
+
+        self._log(model_name, f"str+tools:{rounds_done}", elapsed, client_ip)
+        return sse_response
+
+    async def _stream_with_tool_intercept(self, request, data, model_name,
+                                          sse_response, builtin_names, is_anthropic):
+        """Stream first round to client, intercepting builtin tool_use blocks.
+
+        Returns None if the stream completed normally (no builtin tool calls).
+        Returns dict with tool_calls, assistant_content, forwarded_index when
+        builtin tools were called and need server-side execution.
+        Non-Anthropic format is passed through without interception.
+        """
+        send_data = dict(data)
+        send_data["stream"] = True
+
+        # Pick backend
+        route = self.pick_backend(model_name)
+        if not route:
+            return None
+        prep = dict(send_data)
+        prep["model"] = route["model"]
+        if "chat_template_kwargs" in route and "chat_template_kwargs" not in prep:
+            prep["chat_template_kwargs"] = route["chat_template_kwargs"]
+        body_out = json.dumps(prep).encode()
+        url = f"{route['api_base']}{request.path}"
+        qs = request.query_string
+        if qs:
+            url += f"?{qs}"
+        headers = {}
+        for key, val in request.headers.items():
+            if key.lower() not in ("host", "content-length", "transfer-encoding"):
+                headers[key] = val
+        headers["Content-Length"] = str(len(body_out))
+
+        # Tracking state for Anthropic tool_use interception
+        assistant_content = []       # all content blocks for conversation rebuild
+        suppressed_calls = []        # intercepted builtin tool calls
+        cur_block = None             # current block being assembled
+        cur_suppressed = False       # is current block a suppressed builtin tool?
+        cur_tool_json_parts = []     # accumulate input_json_delta for tool blocks
+        forwarded_index = 0          # next client-visible block index
+        had_client_tools = False
+        stop_reason = None
+
+        sem = self.get_backend_semaphore(
+            route["api_base"], route.get("max_concurrent") or None)
+        try:
+            async with sem:
+                async with self.session.post(url, data=body_out, headers=headers) as resp:
+                    if resp.status >= 400:
+                        body = await resp.read()
+                        await sse_response.write(body)
+                        try:
+                            await sse_response.write_eof()
+                        except Exception:
+                            pass
+                        return None
+
+                    self.mark_success(model_name, route)
+                    sse_buf = b""
+                    reader = resp.content
+
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                reader.read(65536),
+                                timeout=self.KEEPALIVE_INTERVAL)
+                            if not chunk:
+                                break
+                        except asyncio.TimeoutError:
+                            try:
+                                await sse_response.write(b": keepalive\n\n")
+                            except (ConnectionResetError, ConnectionError):
+                                return None
+                            continue
+
+                        sse_buf += chunk
+                        while b"\n\n" in sse_buf:
+                            event_raw, sse_buf = sse_buf.split(b"\n\n", 1)
+                            event_bytes = event_raw + b"\n\n"
+
+                            ev = self._parse_sse_event(event_raw)
+                            if ev is None:
+                                # SSE comment or [DONE] — forward raw
+                                await sse_response.write(event_bytes)
+                                continue
+
+                            if not is_anthropic:
+                                # Non-Anthropic: no interception, raw passthrough
+                                await sse_response.write(event_bytes)
+                                continue
+
+                            # --- Anthropic event handling ---
+                            ev_type = ev.get("type", "")
+
+                            if ev_type == "message_start":
+                                await self._sse_write(
+                                    sse_response, "message_start", ev)
+                                continue
+
+                            if ev_type == "content_block_start":
+                                block = ev.get("content_block", {})
+                                block_type = block.get("type", "")
+
+                                if block_type == "tool_use":
+                                    tool_name = block.get("name", "")
+                                    tool_id = block.get("id", "")
+                                    if tool_name in builtin_names:
+                                        cur_suppressed = True
+                                        cur_block = {"type": "tool_use",
+                                                     "id": tool_id,
+                                                     "name": tool_name,
+                                                     "input": {}}
+                                        cur_tool_json_parts = []
+                                    else:
+                                        cur_suppressed = False
+                                        had_client_tools = True
+                                        cur_block = {"type": "tool_use",
+                                                     "id": tool_id,
+                                                     "name": tool_name,
+                                                     "input": {}}
+                                        cur_tool_json_parts = []
+                                        fwd = dict(ev)
+                                        fwd["index"] = forwarded_index
+                                        await self._sse_write(
+                                            sse_response,
+                                            "content_block_start", fwd)
+                                        forwarded_index += 1
+                                else:
+                                    # thinking / text — always forward
+                                    cur_suppressed = False
+                                    cur_block = {"type": block_type}
+                                    fwd = dict(ev)
+                                    fwd["index"] = forwarded_index
+                                    await self._sse_write(
+                                        sse_response,
+                                        "content_block_start", fwd)
+                                    forwarded_index += 1
+                                continue
+
+                            if ev_type == "content_block_delta":
+                                delta = ev.get("delta", {})
+                                delta_type = delta.get("type", "")
+
+                                if cur_suppressed:
+                                    if delta_type == "input_json_delta":
+                                        cur_tool_json_parts.append(
+                                            delta.get("partial_json", ""))
+                                    continue
+
+                                # Forward with the client-visible index
+                                fwd = dict(ev)
+                                fwd["index"] = forwarded_index - 1
+                                await self._sse_write(
+                                    sse_response,
+                                    "content_block_delta", fwd)
+
+                                # Collect text for conversation rebuild
+                                if cur_block is not None:
+                                    if delta_type == "thinking_delta":
+                                        cur_block["thinking"] = (
+                                            cur_block.get("thinking", "")
+                                            + delta.get("thinking", ""))
+                                        sig = delta.get("signature")
+                                        if sig:
+                                            cur_block["signature"] = sig
+                                    elif delta_type == "text_delta":
+                                        cur_block["text"] = (
+                                            cur_block.get("text", "")
+                                            + delta.get("text", ""))
+                                    elif delta_type == "input_json_delta":
+                                        cur_tool_json_parts.append(
+                                            delta.get("partial_json", ""))
+                                continue
+
+                            if ev_type == "content_block_stop":
+                                if cur_suppressed:
+                                    raw_json = "".join(cur_tool_json_parts)
+                                    try:
+                                        cur_block["input"] = (
+                                            json.loads(raw_json)
+                                            if raw_json else {})
+                                    except json.JSONDecodeError:
+                                        cur_block["input"] = {}
+                                    suppressed_calls.append({
+                                        "id": cur_block["id"],
+                                        "name": cur_block["name"],
+                                        "input": cur_block["input"]})
+                                    assistant_content.append(cur_block)
+                                else:
+                                    fwd = dict(ev)
+                                    fwd["index"] = forwarded_index - 1
+                                    await self._sse_write(
+                                        sse_response,
+                                        "content_block_stop", fwd)
+                                    # Finalize non-tool blocks
+                                    if cur_block is not None:
+                                        if cur_block["type"] != "tool_use":
+                                            assistant_content.append(
+                                                dict(cur_block))
+                                        else:
+                                            # Client tool_use — also collect
+                                            raw_json = "".join(
+                                                cur_tool_json_parts)
+                                            try:
+                                                cur_block["input"] = (
+                                                    json.loads(raw_json)
+                                                    if raw_json else {})
+                                            except json.JSONDecodeError:
+                                                cur_block["input"] = {}
+                                            assistant_content.append(
+                                                dict(cur_block))
+
+                                cur_block = None
+                                cur_suppressed = False
+                                cur_tool_json_parts = []
+                                continue
+
+                            if ev_type == "message_delta":
+                                delta = ev.get("delta", {})
+                                stop_reason = delta.get("stop_reason")
+                                if (suppressed_calls
+                                        and stop_reason == "tool_use"):
+                                    # Hold back — we continue after tool exec
+                                    continue
+                                await self._sse_write(
+                                    sse_response, "message_delta", ev)
+                                continue
+
+                            if ev_type == "message_stop":
+                                if suppressed_calls:
+                                    continue  # hold back
+                                await self._sse_write(
+                                    sse_response, "message_stop", ev)
+                                continue
+
+                            # Unknown event — forward raw
+                            await sse_response.write(event_bytes)
+
+        except (ConnectionResetError, ConnectionError):
+            return None
+        except Exception as exc:
+            self.mark_failed(model_name, route)
+            print(f"  {model_name}: streaming tool intercept error: {exc}",
+                  flush=True)
+            return None
+
+        if not suppressed_calls:
+            # No builtin tool calls — streaming completed normally
+            try:
+                await sse_response.write_eof()
+            except Exception:
+                pass
+            return None
+
+        return {
+            "tool_calls": suppressed_calls,
+            "assistant_content": assistant_content,
+            "forwarded_index": forwarded_index,
+        }
 
     async def _backend_call_json(self, request, model_name, send_data):
         """Non-streaming backend call with failover. Returns the parsed JSON body."""
