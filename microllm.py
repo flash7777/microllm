@@ -18,7 +18,7 @@ import sys
 import time
 from collections import defaultdict
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urljoin, quote
+from urllib.parse import urlparse, urljoin, quote, unquote
 
 import yaml
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
@@ -1439,7 +1439,9 @@ class MicroLLM:
             }, "required": ["query"]},
         ),
         "uri_fetch": (
-            "Fetch a web page and return its content as text. Use after uri_search to read a specific URL.",
+            "Fetch a web page and return its content as text. PDF files are "
+            "processed: the result contains the extracted text plus page figures. "
+            "Use after uri_search to read a specific URL.",
             {"type": "object", "properties": {
                 "url": {"type": "string", "description": "Absolute URL to fetch (http/https)"},
             }, "required": ["url"]},
@@ -1451,6 +1453,7 @@ class MicroLLM:
     WEB_FETCH_SERVICE_TIMEOUT = 90  # open_fetch retries internally (3x + backoff)
     WEB_FETCH_MAX_BYTES = 500 * 1024
     WEB_FETCH_MAX_CHARS = 30000
+    WEB_FETCH_PDF_MAX_BYTES = 20 * 1024 * 1024  # PDFs to the PDF pipeline (Tika cap)
 
     def _tool_definitions(self, is_anthropic, names):
         """Tool definitions in the wire format of the given API."""
@@ -1559,7 +1562,8 @@ class MicroLLM:
                   f"{[c['name'] for c in calls]}", flush=True)
             results = {}
             for call in calls:
-                results[call["id"]] = await self._execute_builtin(call)
+                results[call["id"]] = await self._execute_builtin(
+                    call, group_meta, is_anthropic)
             data = self._append_tool_round(data, resp_json, calls, results, is_anthropic)
 
         self.stats[model_name]["total_gen_s"] += time.monotonic() - t0
@@ -1591,7 +1595,26 @@ class MicroLLM:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _tool_trace_details_html(entries, max_result_chars=2000):
+    def _tool_result_text(result, max_chars=2000):
+        """Render a tool result for the trace as text. Block lists (fetched
+        PDFs) become their text parts + an image counter — base64 never
+        reaches the HTML attributes."""
+        if isinstance(result, list):
+            text_parts = [b.get("text", "") for b in result
+                          if isinstance(b, dict) and b.get("type") == "text"]
+            n_images = sum(1 for b in result
+                           if isinstance(b, dict) and b.get("type") in ("image", "image_url"))
+            text = "\n".join(text_parts)
+            if n_images:
+                text += f"\n[{n_images} images passed to the model]"
+        else:
+            text = result if isinstance(result, str) else str(result)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n[... truncated ...]"
+        return text
+
+    @classmethod
+    def _tool_trace_details_html(cls, entries, max_result_chars=2000):
         import html as _html
         parts = []
         for entry in entries:
@@ -1599,9 +1622,7 @@ class MicroLLM:
             call_id = str(entry.get("id", ""))
             arguments = entry.get("input", {}) or {}
             result = entry.get("result", "")
-            result_text = result if isinstance(result, str) else str(result)
-            if len(result_text) > max_result_chars:
-                result_text = result_text[:max_result_chars] + "\n[... truncated ...]"
+            result_text = cls._tool_result_text(result, max_result_chars)
             args_attr = _html.escape(json.dumps(arguments, ensure_ascii=False), quote=True)
             res_attr = _html.escape(json.dumps(result_text, ensure_ascii=False), quote=True)
             parts.append(
@@ -1709,7 +1730,8 @@ class MicroLLM:
               f"{[c['name'] for c in tool_calls]}", flush=True)
         results = {}
         for call in tool_calls:
-            results[call["id"]] = await self._execute_builtin(call)
+            results[call["id"]] = await self._execute_builtin(
+                call, group_meta, is_anthropic)
 
         # Option A: show the executed tool calls to the client (as content)
         anthropic_next_index = intercept["forwarded_index"]
@@ -1766,7 +1788,8 @@ class MicroLLM:
                   f"{[c['name'] for c in calls]}", flush=True)
             results = {}
             for call in calls:
-                results[call["id"]] = await self._execute_builtin(call)
+                results[call["id"]] = await self._execute_builtin(
+                    call, group_meta, is_anthropic)
             # Option A: show this round's tool calls to the client (as content)
             trace_entries = [{"id": c["id"], "name": c["name"], "input": c["input"],
                               "result": results.get(c["id"], "")} for c in calls]
@@ -2336,8 +2359,10 @@ class MicroLLM:
                                          "content": results.get(c["id"], "")})
         return data
 
-    async def _execute_builtin(self, call):
-        """Execute one builtin tool. Returns the text result for the model."""
+    async def _execute_builtin(self, call, group_meta=None, is_anthropic=False):
+        """Execute one builtin tool. Returns the result for the model: a text
+        string, or (for fetched PDFs) a list of text/image content blocks in
+        the wire format of the target API (vision models read the figures)."""
         name = call["name"]
         args = call["input"] or {}
         t0 = time.monotonic()
@@ -2356,13 +2381,38 @@ class MicroLLM:
                 url = str(args.get("url", "")).strip()
                 if not url:
                     return "Error: missing 'url' argument"
-                text = await self._web_fetch(url)
+                fetched = await self._web_fetch(url)
+                if isinstance(fetched, dict):
+                    text = await self._fetched_pdf_to_blocks(
+                        fetched, url, group_meta, is_anthropic)
+                else:
+                    text = fetched
             else:
                 return f"Error: unknown builtin tool '{name}'"
         except Exception as e:
             text = f"Error: {e}"
-        print(f"  builtin {name}: {time.monotonic() - t0:.1f}s, {len(text)} chars", flush=True)
+        if isinstance(text, list):
+            n_images = sum(1 for b in text
+                           if isinstance(b, dict) and b.get("type") in ("image", "image_url"))
+            print(f"  builtin {name}: {time.monotonic() - t0:.1f}s, "
+                  f"{len(text)} blocks, {n_images} images", flush=True)
+        else:
+            print(f"  builtin {name}: {time.monotonic() - t0:.1f}s, {len(text)} chars", flush=True)
         return text
+
+    async def _fetched_pdf_to_blocks(self, pdf_info, url, group_meta, is_anthropic):
+        """Route a fetched PDF (open_fetch kind="pdf") through the same PDF
+        pipeline as chat uploads (Tika text + figures/vision)."""
+        b64 = pdf_info.get("b64", "")
+        if not b64:
+            return f"Error: PDF too large to process ({pdf_info.get('bytes', '?')} bytes): {url}"
+        path = urlparse(url).path
+        filename = unquote(path.rsplit("/", 1)[-1]) if path else "document.pdf"
+        size_kb = len(b64) * 3 // 4 // 1024
+        blocks = [self._text_block(f"Fetched PDF {url} ({size_kb}KB):")]
+        blocks.extend(await self._pdf_to_blocks(
+            b64, (group_meta or {}).get("pdf"), is_anthropic, filename))
+        return blocks
 
     @staticmethod
     def _url_is_safe(url):
@@ -2399,13 +2449,22 @@ class MicroLLM:
             data = await resp.json()
         if not data.get("ok"):
             return f"Error: {data.get('error', 'fetch failed')} for {url}"
+        if data.get("kind") == "pdf":
+            # open_fetch delivers PDFs raw (base64) — the tool executor routes
+            # them through the PDF pipeline like chat uploads do
+            return {"kind": "pdf", "url": data.get("final_url", url),
+                    "bytes": data.get("bytes", 0), "b64": data.get("b64", "")}
         text = data.get("text", "")
         if len(text) > self.WEB_FETCH_MAX_CHARS:
             text = text[:self.WEB_FETCH_MAX_CHARS] + "\n[... truncated ...]"
         return f"Content of {url}:\n\n{text}"
 
     async def _web_fetch(self, url):
-        """Fetch a URL (SSRF-guarded, redirects re-checked) and return its text."""
+        """Fetch a URL (SSRF-guarded, redirects re-checked).
+
+        Returns the page text, or (for PDFs) a dict {"kind": "pdf", ...}
+        that the tool executor routes through the PDF pipeline.
+        """
         if self.web_fetch_url:
             try:
                 return await self._web_fetch_via_service(url)
@@ -2436,7 +2495,16 @@ class MicroLLM:
                     if resp.status >= 400:
                         return f"Error: HTTP {resp.status} for {current}"
                     content_type = resp.headers.get("content-type", "")
-                    if "pdf" in content_type or "octet-stream" in content_type:
+                    if "pdf" in content_type:
+                        pdf_chunk = await resp.content.read(
+                            self.WEB_FETCH_PDF_MAX_BYTES + 1)
+                        if len(pdf_chunk) > self.WEB_FETCH_PDF_MAX_BYTES:
+                            return (f"Error: PDF too large (> "
+                                    f"{self.WEB_FETCH_PDF_MAX_BYTES // (1024 * 1024)}MB): "
+                                    f"{current}")
+                        return {"kind": "pdf", "url": current, "bytes": len(pdf_chunk),
+                                "b64": base64.b64encode(pdf_chunk).decode("ascii")}
+                    if "octet-stream" in content_type:
                         return f"Error: {current} is not a text page (content-type: {content_type})"
                     chunk = await resp.content.read(self.WEB_FETCH_MAX_BYTES + 1)
             except asyncio.TimeoutError:

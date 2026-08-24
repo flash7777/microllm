@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Functional tests for the microllm builtin tool executor + PDF conversion.
 
-Runs microllm as a subprocess (tests/config.yaml, port 18123) against three
+Runs microllm as a subprocess (tests/config.yaml, port 18123) against four
 in-process mocks:
   18192 fake vLLM backend (openai /v1/chat/completions + anthropic /v1/messages)
   18191 fake SearXNG (GET /search)
   18190 fake Taki (PUT /tika/pdf2chat, PUT /tika/text)
+  18193 fake open_fetch (GET /fetch, text + kind="pdf" answers)
 
 The fake vLLM is a state machine:
   round 1 -> uri_search tool call
-  round 2 -> uri_fetch tool call (url https://example.com, real fetch)
+  round 2 -> uri_fetch tool call (url https://example.com via fake open_fetch)
   round 3 -> final answer
   user text "ALWAYS-SEARCH" -> always a tool call (max-rounds test)
+  user text "PDF-FETCH"     -> straight to uri_fetch of https://example.com/handbuch.pdf
+                               (fake open_fetch answers kind="pdf" + base64)
 
-web_fetch really fetches https://example.com, so the test needs outbound DNS/HTTPS.
+All fetches run against the local fake open_fetch — no outbound network needed.
 
 Usage:  python3 tests/test_toolloop.py
 """
@@ -24,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
@@ -53,17 +57,51 @@ def check(name, cond, detail=""):
 
 # ---------- fake vLLM ----------
 
+def _user_says(messages, marker):
+    """True if any user message (str or content-block list) contains marker."""
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            if marker in content:
+                return True
+        elif isinstance(content, list):
+            if any(marker in str(b.get("text", "")) for b in content if isinstance(b, dict)):
+                return True
+    return False
+
+
+def _content_is_fetch_result(content):
+    """Tool-result content: plain page text ('Content of ...') or a fetched
+    PDF block list (text parts 'Fetched PDF ...' and/or image parts)."""
+    if isinstance(content, str):
+        return content.startswith("Content of")
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") in ("image", "image_url"):
+                return True
+            if b.get("type") == "text" and b.get("text", "").startswith("Fetched PDF"):
+                return True
+    return False
+
+
 def openai_state(messages):
     always = any("ALWAYS-SEARCH" in str(m.get("content", ""))
                  for m in messages if m.get("role") == "user")
     if always:
         return "search"
-    has_fetch = any(m.get("role") == "tool" and str(m.get("content", "")).startswith("Content of")
+    has_fetch = any(m.get("role") == "tool" and _content_is_fetch_result(m.get("content"))
                     for m in messages)
     if has_fetch:
         return "final"
     has_search = any(m.get("role") == "tool" and str(m.get("content", "")).startswith("Web search")
                      for m in messages)
+    if _user_says(messages, "PDF-FETCH"):
+        # PDF tests skip the search round and go straight to the PDF fetch
+        return "fetch"
     if has_search:
         return "fetch"
     return "search"
@@ -123,14 +161,16 @@ def anthropic_state(messages):
         if m.get("role") == "user" and isinstance(m.get("content"), list):
             for b in m["content"]:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    c = str(b.get("content", ""))
-                    if c.startswith("Content of"):
+                    c = b.get("content", "")
+                    if _content_is_fetch_result(c):
                         has_fetch = True
+                    elif isinstance(c, str) and c.startswith("Web search"):
+                        has_search = True
                     else:
                         has_search = True
     if has_fetch:
         return "final"
-    if has_search:
+    if _user_says(messages, "PDF-FETCH") or has_search:
         return "fetch"
     return "search"
 
@@ -172,7 +212,9 @@ def make_vllm_app():
                 return openai_sse_response(openai_sse_events_tool(model, "call_1", "uri_search", args))
             return web.json_response(openai_tool(model, "call_1", "uri_search", args))
         if state == "fetch":
-            args = {"url": "https://example.com"}
+            pdf_mode = _user_says(body.get("messages", []), "PDF-FETCH")
+            args = {"url": "https://example.com/handbuch.pdf"} if pdf_mode \
+                else {"url": "https://example.com"}
             if stream:
                 return openai_sse_response(openai_sse_events_tool(model, "call_2", "uri_fetch", args))
             return web.json_response(openai_tool(model, "call_2", "uri_fetch", args))
@@ -188,7 +230,9 @@ def make_vllm_app():
         if state == "search":
             return web.json_response(anthropic_tool(model, "toolu_1", "uri_search", {"query": "OpenCloud KOSMOS"}))
         if state == "fetch":
-            return web.json_response(anthropic_tool(model, "toolu_2", "uri_fetch", {"url": "https://example.com"}))
+            pdf_mode = _user_says(body.get("messages", []), "PDF-FETCH")
+            url = "https://example.com/handbuch.pdf" if pdf_mode else "https://example.com"
+            return web.json_response(anthropic_tool(model, "toolu_2", "uri_fetch", {"url": url}))
         return web.json_response(anthropic_final(model))
 
     app.router.add_get("/v1/models", models)
@@ -229,6 +273,37 @@ def make_taki_app():
 
     app.router.add_put("/tika/pdf2chat", pdf2chat)
     app.router.add_put("/tika/text", text)
+    return app
+
+
+def make_webfetch_app():
+    """Fake open_fetch service (bot-safe fetcher): answers text pages, and
+    kind="pdf" + base64 for the handbuch.pdf test URL (like the real
+    service since the PDF feature). Private/loopback URLs are refused."""
+    app = web.Application()
+    pdf_bytes = base64.b64decode(PDF_NORMAL)
+
+    async def fetch(request):
+        url = request.query.get("url", "")
+        host = urlparse(url).hostname or ""
+        if host in ("127.0.0.1", "localhost") or host.startswith("192.168."):
+            return web.json_response({"ok": False,
+                                      "error": f"URL not allowed (only public http/https): {url}"})
+        if url.endswith("/handbuch.pdf"):
+            return web.json_response({
+                "ok": True, "kind": "pdf", "status": 200, "final_url": url,
+                "content_type": "application/pdf", "bytes": len(pdf_bytes),
+                "b64": PDF_NORMAL, "text": f"[PDF-Datei: {len(pdf_bytes)} bytes]"})
+        return web.json_response({
+            "ok": True, "status": 200, "final_url": url,
+            "content_type": "text/html", "bytes": 24,
+            "text": "Example page text (fake open_fetch)"})
+
+    async def health(_):
+        return web.json_response({"status": "ok"})
+
+    app.router.add_get("/fetch", fetch)
+    app.router.add_get("/health", health)
     return app
 
 
@@ -496,6 +571,162 @@ async def t10_max_rounds_forced(sess):
           len(find_marker(marker, "/v1/chat/completions")))
 
 
+async def t11_pdf_fetch_openai(sess):
+    print("T11: uri_fetch of a PDF (openai) -> multimodal tool result")
+    marker = "MK-T11"
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "testgroup", "stream": False,
+        "messages": [{"role": "user", "content": f"PDF-FETCH {marker}"}]})
+    body = json.loads(text)
+    content = body.get("choices", [{}])[0].get("message", {}).get("content")
+    check("T11 status 200", status == 200, text[:200])
+    check("T11 final answer", content == "FINAL-ANSWER-OK", str(content)[:200])
+    entries = find_marker(marker, "/v1/chat/completions")
+    check("T11 2 backend rounds (search skipped)", len(entries) == 2, len(entries))
+    if len(entries) == 2:
+        r2 = entries[1]["body"]
+        tool_msgs = [m for m in r2.get("messages", []) if m.get("role") == "tool"]
+        check("T11 one tool result", len(tool_msgs) == 1, len(tool_msgs))
+        c = tool_msgs[0].get("content")
+        check("T11 tool content is block list", isinstance(c, list), type(c))
+        if isinstance(c, list):
+            types = [b.get("type") for b in c if isinstance(b, dict)]
+            check("T11 blocks text,text,image", types == ["text", "text", "image_url"], types)
+            check("T11 url header", c[0]["text"].startswith("Fetched PDF https://example.com/handbuch.pdf"),
+                  c[0]["text"][:100])
+            check("T11 tika text", "[Seite 1/2]" in c[1]["text"] and "Hallo Welt" in c[1]["text"],
+                  c[1]["text"][:120])
+            check("T11 filename label", "[PDF handbuch.pdf]" in c[1]["text"], c[1]["text"][:60])
+            check("T11 image data url",
+                  c[2].get("image_url", {}).get("url", "").startswith("data:image/png;base64,")
+                  and PNG_1X1 in c[2].get("image_url", {}).get("url", ""))
+
+
+async def t12_pdf_fetch_stream(sess):
+    print("T12: uri_fetch of a PDF (stream) -> trace without base64")
+    marker = "MK-T12"
+    async with sess.post(MICROLLM + "/v1/chat/completions", json={
+        "model": "testgroup", "stream": True,
+        "messages": [{"role": "user", "content": f"PDF-FETCH {marker}"}]}) as resp:
+        ct = resp.headers.get("content-type", "")
+        raw = await resp.text()
+    check("T12 sse content-type", "text/event-stream" in ct, ct)
+    check("T12 done marker", "data: [DONE]" in raw, raw[-120:])
+    chunks = []
+    for ln in raw.splitlines():
+        if ln.startswith("data: ") and ln[6:] != "[DONE]":
+            try:
+                chunks.append(json.loads(ln[6:]))
+            except json.JSONDecodeError:
+                pass
+    parts = []
+    for c in chunks:
+        for ch in c.get("choices", []):
+            if ch.get("delta", {}).get("content"):
+                parts.append(ch["delta"]["content"])
+    content = "".join(parts)
+    check("T12 streamed final answer", "FINAL-ANSWER-OK" in content, content[:200])
+    check("T12 trace fetch card", 'name="uri_fetch"' in content, content[:300])
+    check("T12 trace tika text", "Hallo Welt" in content, content[:400])
+    check("T12 trace image counter", "1 images passed to the model" in content, content[:400])
+    check("T12 no base64 in stream", PNG_1X1 not in content and "iVBORw0KGgo" not in content,
+          content[:400])
+    check("T12 2 backend rounds", len(find_marker(marker, "/v1/chat/completions")) == 2,
+          len(find_marker(marker, "/v1/chat/completions")))
+
+
+async def t13_pdf_fetch_anthropic(sess):
+    print("T13: uri_fetch of a PDF (anthropic) -> tool_result block list")
+    marker = "MK-T13"
+    status, _ct, text = await post(sess, "/v1/messages", {
+        "model": "testgroup",
+        "messages": [{"role": "user", "content": f"PDF-FETCH {marker}"}]})
+    body = json.loads(text)
+    texts = [b.get("text") for b in body.get("content", [])
+             if isinstance(b, dict) and b.get("type") == "text"]
+    check("T13 status 200", status == 200, text[:200])
+    check("T13 final answer", texts == ["FINAL-ANSWER-OK"], texts[:1] if texts else text[:200])
+    entries = find_marker(marker, "/v1/messages")
+    check("T13 2 backend rounds", len(entries) == 2, len(entries))
+    if len(entries) == 2:
+        m2 = entries[1]["body"].get("messages", [])
+        tool_results = [b for m in m2 if m.get("role") == "user" and isinstance(m.get("content"), list)
+                        for b in m["content"]
+                        if isinstance(b, dict) and b.get("type") == "tool_result"]
+        check("T13 one tool_result", len(tool_results) == 1, len(tool_results))
+        c = tool_results[0].get("content") if tool_results else None
+        check("T13 tool_result is block list", isinstance(c, list), type(c))
+        if isinstance(c, list):
+            types = [b.get("type") for b in c if isinstance(b, dict)]
+            check("T13 blocks text,text,image", types == ["text", "text", "image"], types)
+            check("T13 anthropic image block",
+                  c[2].get("source", {}).get("type") == "base64"
+                  and c[2].get("source", {}).get("data") == PNG_1X1)
+
+
+async def t14_pdf_units():
+    print("T14: unit tests (tool result text, fetched PDF blocks, in-process PDF fetch)")
+    sys.path.insert(0, REPO)
+    import microllm as m
+
+    blocks = [{"type": "text", "text": "abc"},
+              {"type": "image_url", "image_url": {"url": "data:image/png;base64,QQ=="}},
+              {"type": "text", "text": "def"}]
+    txt = m.MicroLLM._tool_result_text(blocks)
+    check("T14 result text from parts", txt.startswith("abc\ndef"), txt)
+    check("T14 image counter", "[1 images passed to the model]" in txt, txt)
+    check("T14 no b64 in trace text", "QQ==" not in txt, txt)
+    check("T14 str passthrough", m.MicroLLM._tool_result_text("plain") == "plain")
+    check("T14 truncation", len(m.MicroLLM._tool_result_text("x" * 5000)) < 2100,
+          len(m.MicroLLM._tool_result_text("x" * 5000)))
+
+    # in-process _web_fetch: PDF content-type -> b64 dict (SSRF patched, local server)
+    pdf_bytes = base64.b64decode(PDF_NORMAL)
+
+    async def serve_pdf(_):
+        return web.Response(body=pdf_bytes, content_type="application/pdf")
+
+    _app = web.Application()
+    _app.router.add_get("/x.pdf", serve_pdf)
+    runner = web.AppRunner(_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 18194)
+    await site.start()
+    proxy = m.MicroLLM.__new__(m.MicroLLM)
+    proxy.session = aiohttp.ClientSession()
+    proxy.web_fetch_url = None
+    proxy.ocr_url = "http://127.0.0.1:18190"
+    proxy._url_is_safe = lambda u: True
+    try:
+        res = await proxy._web_fetch("http://127.0.0.1:18194/x.pdf")
+        check("T14 in-process pdf is dict",
+              isinstance(res, dict) and res.get("kind") == "pdf", str(res)[:120])
+        check("T14 in-process pdf b64",
+              isinstance(res, dict) and base64.b64decode(res.get("b64", "")) == pdf_bytes)
+
+        # _fetched_pdf_to_blocks: empty b64 -> error, b64 -> pipeline blocks (fake Taki 18190)
+        err = await proxy._fetched_pdf_to_blocks(
+            {"kind": "pdf", "url": "https://x.com/a.pdf", "bytes": 99, "b64": ""},
+            "https://x.com/a.pdf", None, False)
+        check("T14 empty b64 -> error", isinstance(err, str) and err.startswith("Error: PDF too large"),
+              str(err)[:120])
+        blocks2 = await proxy._fetched_pdf_to_blocks(
+            {"kind": "pdf", "url": "https://x.com/handbuch.pdf", "bytes": len(pdf_bytes), "b64": PDF_NORMAL},
+            "https://x.com/handbuch.pdf",
+            {"pdf": {"enabled": True, "images": True, "vision": True, "dpi": 100, "max_image_pages": 8}},
+            False)
+        check("T14 fetched pdf blocks", isinstance(blocks2, list) and len(blocks2) == 3,
+              str(blocks2)[:120] if not isinstance(blocks2, list) else [b.get("type") for b in blocks2])
+        if isinstance(blocks2, list) and len(blocks2) == 3:
+            check("T14 block order", [b.get("type") for b in blocks2] == ["text", "text", "image_url"])
+            check("T14 url header", blocks2[0]["text"].startswith("Fetched PDF https://x.com/handbuch.pdf"),
+                  blocks2[0]["text"][:100])
+            check("T14 tika text in block", "Hallo Welt" in blocks2[1]["text"], blocks2[1]["text"][:120])
+    finally:
+        await proxy.session.close()
+        await runner.cleanup()
+
+
 # ---------- main ----------
 
 async def main():
@@ -503,13 +734,14 @@ async def main():
     os.makedirs(CHATLOG, exist_ok=True)
 
     runners = []
-    for app, port in ((make_vllm_app(), 18192), (make_searxng_app(), 18191), (make_taki_app(), 18190)):
+    for app, port in ((make_vllm_app(), 18192), (make_searxng_app(), 18191),
+                      (make_taki_app(), 18190), (make_webfetch_app(), 18193)):
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", port)
         await site.start()
         runners.append(runner)
-    print("mocks up (vllm 18192, searxng 18191, taki 18190)")
+    print("mocks up (vllm 18192, searxng 18191, taki 18190, webfetch 18193)")
 
     logf = open(MICROLLM_LOG, "w")
     proc = subprocess.Popen([sys.executable, MICROLLM_PY, os.path.join(HERE, "config.yaml"), "18123"],
@@ -543,6 +775,10 @@ async def main():
             await t8_alias_inheritance(sess)
             await t9_units()
             await t10_max_rounds_forced(sess)
+            await t11_pdf_fetch_openai(sess)
+            await t12_pdf_fetch_stream(sess)
+            await t13_pdf_fetch_anthropic(sess)
+            await t14_pdf_units()
     finally:
         proc.terminate()
         try:

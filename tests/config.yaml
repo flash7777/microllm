@@ -5,6 +5,7 @@ general_settings:
   port: 18123
   ocr_url: http://127.0.0.1:18190
   web_search_url: http://127.0.0.1:18191
+  web_fetch_url: http://127.0.0.1:18193
   chatlog_dir: /tmp/microllm-test-work/chatlog
 
 model_list:
