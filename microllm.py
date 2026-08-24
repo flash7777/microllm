@@ -253,7 +253,7 @@ class MicroLLM:
 
     @staticmethod
     def _default_pdf_meta():
-        return {"enabled": True, "images": False, "vision": False, "dpi": 100, "max_image_pages": 8}
+        return {"enabled": True, "images": False, "vision": False, "vector": False, "dpi": 100, "max_image_pages": 8}
 
     def _apply_group_meta(self, name, entry, store=None, flush=False):
         """Merge builtin/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
@@ -1227,11 +1227,14 @@ class MicroLLM:
         vision = want_images and pdf_meta.get("vision", False)
         # describe=1 always (with images): Taki only describes EMBEDDED
         # figures, linking them to the surrounding page text.
+        # vector=1: render vector-drawing clusters (diagrams, schematics)
+        # that have no embedded raster equivalent.
         text, images, _total_pages = await self._call_pdf2chat(
             pdf_b64,
             images_enabled=want_images,
             describe=want_images,
             ocr=not vision,
+            vector=vision,
             dpi=int(pdf_meta.get("dpi", 100)),
             max_pages=int(pdf_meta.get("max_image_pages", 8)),
         )
@@ -1263,13 +1266,15 @@ class MicroLLM:
         return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
     async def _call_pdf2chat(self, pdf_base64, images_enabled, describe, dpi, max_pages,
-                             ocr=True):
+                             ocr=True, vector=False):
         """Extract text (+ images) from PDF via Taki.
 
         Tries PUT {ocr_url}/tika/pdf2chat (page markers + rescued images);
         falls back to /tika/text (text only) on 404 (older Taki).
         ocr=False: Taki skips OCR of weak pages (vision clients read the
         scan images directly).
+        vector=True: Taki renders vector-drawing clusters (diagrams,
+        schematics) via PyMuPDF + pdftoppm crop.
         Returns (text, images, total_pages).
         """
         try:
@@ -1281,6 +1286,8 @@ class MicroLLM:
             query += "&describe=1"
         if not ocr:
             query += "&ocr=0"
+        if vector:
+            query += "&vector=1"
         url = f"{self.ocr_url}/tika/pdf2chat?{query}"
         try:
             async with self.session.put(
