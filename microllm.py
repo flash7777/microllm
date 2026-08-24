@@ -1225,19 +1225,41 @@ class MicroLLM:
         # Vision: scan images go straight into the chat as image blocks,
         # the VLM reads them — Taki skips OCR (ocr=0), no text needed.
         vision = want_images and pdf_meta.get("vision", False)
+        pdf_dpi = int(pdf_meta.get("dpi", 100))
+        max_pages = int(pdf_meta.get("max_image_pages", 8))
+        # max_pages applies to IMAGE processing only (Taki). Text is always
+        # extracted for ALL pages — "bis Seite 8 von 70" must never happen.
         # describe=1 always (with images): Taki only describes EMBEDDED
         # figures, linking them to the surrounding page text.
         # vector=1: render vector-drawing clusters (diagrams, schematics)
         # that have no embedded raster equivalent.
-        text, images, _total_pages = await self._call_pdf2chat(
+        text, images, total_pages = await self._call_pdf2chat(
             pdf_b64,
             images_enabled=want_images,
             describe=want_images,
             ocr=not vision,
             vector=vision,
-            dpi=int(pdf_meta.get("dpi", 100)),
-            max_pages=int(pdf_meta.get("max_image_pages", 8)),
+            dpi=pdf_dpi,
+            max_pages=max_pages,
         )
+        # Taki < 20260824-2145: max_pages truncated the TEXT as well
+        # (marker "[PDF gekürzt: nur die ersten N von P Seiten verarbeitet]").
+        # Re-extract text-only for the full document, keep the cached images.
+        if total_pages and total_pages != max_pages and text:
+            full_text, _full_images, _ = await self._call_pdf2chat(
+                pdf_b64,
+                images_enabled=False,
+                describe=False,
+                ocr=True,
+                vector=False,
+                dpi=pdf_dpi,
+                max_pages=total_pages,
+            )
+            if len(full_text) > len(text):
+                print(f"  Tika: full-text re-extract "
+                      f"({len(full_text)} > {len(text)} chars, {total_pages} pages)",
+                      flush=True)
+                text = full_text
         blocks = []
         if text:
             blocks.append(self._text_block(f"[PDF {label}]\n\n{text}"))
