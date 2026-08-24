@@ -1461,7 +1461,9 @@ class MicroLLM:
 
     BUILTIN_TOOL_DEFS = {
         "uri_search": (
-            "Search the web. Returns a numbered list of results with title, URL and snippet.",
+            "Search the web. Returns a numbered list of results with title, URL and snippet. "
+            "For technical questions (hardware specs, connections, protocols), include "
+            "'manual', 'specification', 'datasheet' or 'pdf' in the query.",
             {"type": "object", "properties": {
                 "query": {"type": "string", "description": "The search query"},
                 "max_results": {"type": "integer", "description": "Maximum number of results (default 5)"},
@@ -1470,7 +1472,10 @@ class MicroLLM:
         "uri_fetch": (
             "Fetch a web page and return its content as text. PDF files are "
             "processed: the result contains the extracted text plus page figures. "
-            "Use after uri_search to read a specific URL.",
+            "ALWAYS use uri_fetch to read a URL from uri_search results before "
+            "answering — search snippets are not enough for technical details. "
+            "If the fetched page is a product landing page without specs, "
+            "try fetching the manual/datasheet URL instead.",
             {"type": "object", "properties": {
                 "url": {"type": "string", "description": "Absolute URL to fetch (http/https)"},
             }, "required": ["url"]},
