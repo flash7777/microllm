@@ -5,6 +5,7 @@
 general_settings:
   chatlog_dir: /tmp/microllm-chatlog
   web_search_url: duckduckgo
+  web_fetch_url: http://10.89.1.1:8899   # open_fetch service (bot-safe uri_fetch)
 
 service_list:
   - service_name: steno-ml

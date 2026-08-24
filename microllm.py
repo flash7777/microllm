@@ -18,7 +18,7 @@ import sys
 import time
 from collections import defaultdict
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 
 import yaml
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
@@ -141,6 +141,11 @@ class MicroLLM:
         if self.web_search_url:
             self.web_search_url = self.web_search_url.rstrip("/")
             print(f"microllm: web search at {self.web_search_url}")
+
+        self.web_fetch_url = settings.get("web_fetch_url", None)
+        if self.web_fetch_url:
+            self.web_fetch_url = self.web_fetch_url.rstrip("/")
+            print(f"microllm: web fetch service at {self.web_fetch_url}")
 
         self.chatlog_dir = settings.get("chatlog_dir", None)
         if self.chatlog_dir:
@@ -290,6 +295,9 @@ class MicroLLM:
         self.web_search_url = settings.get("web_search_url", None)
         if self.web_search_url:
             self.web_search_url = self.web_search_url.rstrip("/")
+        self.web_fetch_url = settings.get("web_fetch_url", None)
+        if self.web_fetch_url:
+            self.web_fetch_url = self.web_fetch_url.rstrip("/")
         self.chatlog_dir = settings.get("chatlog_dir", None)
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
@@ -1440,6 +1448,7 @@ class MicroLLM:
 
     WEB_FETCH_MAX_REDIRECTS = 3
     WEB_FETCH_TIMEOUT = 15          # seconds per hop
+    WEB_FETCH_SERVICE_TIMEOUT = 90  # open_fetch retries internally (3x + backoff)
     WEB_FETCH_MAX_BYTES = 500 * 1024
     WEB_FETCH_MAX_CHARS = 30000
 
@@ -2307,8 +2316,30 @@ class MicroLLM:
                 return False
         return True
 
+    async def _web_fetch_via_service(self, url):
+        """Fetch via the open_fetch service (bot-safe: TLS-impersonation, retry, cache)."""
+        service_url = f"{self.web_fetch_url}/fetch?url={quote(url, safe='')}"
+        timeout = ClientTimeout(total=self.WEB_FETCH_SERVICE_TIMEOUT)
+        async with self.session.get(service_url, timeout=timeout) as resp:
+            if resp.status >= 400:
+                body = (await resp.text())[:200]
+                raise RuntimeError(f"webfetch service HTTP {resp.status}: {body}")
+            data = await resp.json()
+        if not data.get("ok"):
+            return f"Error: {data.get('error', 'fetch failed')} for {url}"
+        text = data.get("text", "")
+        if len(text) > self.WEB_FETCH_MAX_CHARS:
+            text = text[:self.WEB_FETCH_MAX_CHARS] + "\n[... truncated ...]"
+        return f"Content of {url}:\n\n{text}"
+
     async def _web_fetch(self, url):
         """Fetch a URL (SSRF-guarded, redirects re-checked) and return its text."""
+        if self.web_fetch_url:
+            try:
+                return await self._web_fetch_via_service(url)
+            except Exception as e:
+                print(f"  uri_fetch: service failed ({e}), falling back to in-process",
+                      flush=True)
         current = url
         for _ in range(self.WEB_FETCH_MAX_REDIRECTS + 1):
             if not self._url_is_safe(current):
