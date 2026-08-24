@@ -1583,6 +1583,65 @@ class MicroLLM:
             request, final_resp, model_name, is_stream, is_anthropic, req_seq, sse_response)
 
     # ------------------------------------------------------------------
+    # Option A: executed builtin tool calls are rendered back to the client as
+    # <details type="tool_calls"> text in the content stream. Open WebUI renders
+    # those with ToolCallDisplay. It is pure content — it does NOT trigger the
+    # client's own tool-execution loop (which would re-invoke the LLM with the
+    # builtin tools it cannot execute, ending in an empty re-call).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tool_trace_details_html(entries, max_result_chars=2000):
+        import html as _html
+        parts = []
+        for entry in entries:
+            name = str(entry.get("name", ""))
+            call_id = str(entry.get("id", ""))
+            arguments = entry.get("input", {}) or {}
+            result = entry.get("result", "")
+            result_text = result if isinstance(result, str) else str(result)
+            if len(result_text) > max_result_chars:
+                result_text = result_text[:max_result_chars] + "\n[... truncated ...]"
+            args_attr = _html.escape(json.dumps(arguments, ensure_ascii=False), quote=True)
+            res_attr = _html.escape(json.dumps(result_text, ensure_ascii=False), quote=True)
+            parts.append(
+                f'<details type="tool_calls" done="true" id="{_html.escape(call_id, quote=True)}" '
+                f'name="{_html.escape(name, quote=True)}" arguments="{args_attr}" '
+                f'result="{res_attr}" files="" embeds="[]">\n'
+                f'<summary>Tool Executed</summary>\n</details>\n')
+        return "".join(parts)
+
+    async def _sse_emit_tool_trace(self, sse_response, model_name, entries,
+                                   is_anthropic, next_index=0):
+        """Emit executed tool calls as <details type=tool_calls> content.
+        Returns the next free block index (advanced for Anthropic text blocks)."""
+        if not entries:
+            return next_index
+        details = self._tool_trace_details_html(entries)
+        if not details:
+            return next_index
+        try:
+            if is_anthropic:
+                await self._sse_write(sse_response, "content_block_start", {
+                    "type": "content_block_start", "index": next_index,
+                    "content_block": {"type": "text", "text": ""}})
+                await self._sse_write(sse_response, "content_block_delta", {
+                    "type": "content_block_delta", "index": next_index,
+                    "delta": {"type": "text_delta", "text": details}})
+                await self._sse_write(sse_response, "content_block_stop", {
+                    "type": "content_block_stop", "index": next_index})
+                return next_index + 1
+            base = {"id": f"chatcmpl_tc_{int(time.time() * 1000)}",
+                    "object": "chat.completion.chunk", "created": int(time.time()),
+                    "model": model_name}
+            await self._sse_write(sse_response, None, {
+                **base, "choices": [{"index": 0, "delta": {"content": details},
+                                     "finish_reason": None}]})
+            return next_index
+        except (ConnectionResetError, ConnectionError):
+            return next_index
+
+    # ------------------------------------------------------------------
     # Streaming Tool Loop: first round streams through with tool_use
     # interception, follow-up rounds are buffered with keepalive.
     # ------------------------------------------------------------------
@@ -1652,6 +1711,13 @@ class MicroLLM:
         for call in tool_calls:
             results[call["id"]] = await self._execute_builtin(call)
 
+        # Option A: show the executed tool calls to the client (as content)
+        anthropic_next_index = intercept["forwarded_index"]
+        trace_entries = [{"id": c["id"], "name": c["name"], "input": c["input"],
+                          "result": results.get(c["id"], "")} for c in tool_calls]
+        anthropic_next_index = await self._sse_emit_tool_trace(
+            sse_response, model_name, trace_entries, is_anthropic, anthropic_next_index)
+
         # Rebuild conversation: assistant content + tool results
         if is_anthropic:
             fake_resp = {"content": intercept["assistant_content"],
@@ -1701,6 +1767,12 @@ class MicroLLM:
             results = {}
             for call in calls:
                 results[call["id"]] = await self._execute_builtin(call)
+            # Option A: show this round's tool calls to the client (as content)
+            trace_entries = [{"id": c["id"], "name": c["name"], "input": c["input"],
+                              "result": results.get(c["id"], "")} for c in calls]
+            anthropic_next_index = await self._sse_emit_tool_trace(
+                sse_response, model_name, trace_entries, is_anthropic,
+                anthropic_next_index)
             data = self._append_tool_round(data, resp_json, calls, results, is_anthropic)
 
         elapsed = time.monotonic() - t0
@@ -1718,7 +1790,7 @@ class MicroLLM:
             return sse_response
 
         # --- Phase 4: Emit follow-up answer on the existing SSE stream ---
-        next_index = intercept["forwarded_index"]
+        next_index = anthropic_next_index
         try:
             if is_anthropic:
                 for block in final_resp.get("content", []):

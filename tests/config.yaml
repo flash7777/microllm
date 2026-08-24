@@ -9,7 +9,7 @@ general_settings:
 
 model_list:
   - model_name: testgroup
-    builtin: [web_search, web_fetch]
+    builtin: [uri_search, uri_fetch]
     pdf:
       enabled: true
       images: true

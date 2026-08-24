@@ -8,8 +8,8 @@ in-process mocks:
   18190 fake Taki (PUT /tika/pdf2chat, PUT /tika/text)
 
 The fake vLLM is a state machine:
-  round 1 -> web_search tool call
-  round 2 -> web_fetch tool call (url https://example.com, real fetch)
+  round 1 -> uri_search tool call
+  round 2 -> uri_fetch tool call (url https://example.com, real fetch)
   round 3 -> final answer
   user text "ALWAYS-SEARCH" -> always a tool call (max-rounds test)
 
@@ -85,6 +85,38 @@ def openai_final(model):
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
 
 
+# ---------- OpenAI SSE stream builders (fake vLLM emits real SSE when stream=True) ----------
+
+def openai_sse_events_tool(model, call_id, name, args):
+    base = {"id": f"chatcmpl-{call_id}", "object": "chat.completion.chunk",
+            "created": 1, "model": model}
+    return [
+        {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": None},
+                              "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": call_id, "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}]},
+                              "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+
+
+def openai_sse_events_final(model, text):
+    base = {"id": "chatcmpl-final", "object": "chat.completion.chunk",
+            "created": 1, "model": model}
+    return [
+        {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                              "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+
+
+def openai_sse_response(events):
+    parts = [f"data: {json.dumps(ev)}\n\n" for ev in events]
+    parts.append("data: [DONE]\n\n")
+    return web.Response(text="".join(parts), content_type="text/event-stream")
+
+
 def anthropic_state(messages):
     has_fetch, has_search = False, False
     for m in messages:
@@ -133,10 +165,19 @@ def make_vllm_app():
         await log_request("/v1/chat/completions", body)
         model = body.get("model", "fake-model")
         state = openai_state(body.get("messages", []))
+        stream = bool(body.get("stream"))
         if state == "search":
-            return web.json_response(openai_tool(model, "call_1", "web_search", {"query": "OpenCloud KOSMOS"}))
+            args = {"query": "OpenCloud KOSMOS"}
+            if stream:
+                return openai_sse_response(openai_sse_events_tool(model, "call_1", "uri_search", args))
+            return web.json_response(openai_tool(model, "call_1", "uri_search", args))
         if state == "fetch":
-            return web.json_response(openai_tool(model, "call_2", "web_fetch", {"url": "https://example.com"}))
+            args = {"url": "https://example.com"}
+            if stream:
+                return openai_sse_response(openai_sse_events_tool(model, "call_2", "uri_fetch", args))
+            return web.json_response(openai_tool(model, "call_2", "uri_fetch", args))
+        if stream:
+            return openai_sse_response(openai_sse_events_final(model, "FINAL-ANSWER-OK"))
         return web.json_response(openai_final(model))
 
     async def messages(request):
@@ -145,9 +186,9 @@ def make_vllm_app():
         model = body.get("model", "fake-model")
         state = anthropic_state(body.get("messages", []))
         if state == "search":
-            return web.json_response(anthropic_tool(model, "toolu_1", "web_search", {"query": "OpenCloud KOSMOS"}))
+            return web.json_response(anthropic_tool(model, "toolu_1", "uri_search", {"query": "OpenCloud KOSMOS"}))
         if state == "fetch":
-            return web.json_response(anthropic_tool(model, "toolu_2", "web_fetch", {"url": "https://example.com"}))
+            return web.json_response(anthropic_tool(model, "toolu_2", "uri_fetch", {"url": "https://example.com"}))
         return web.json_response(anthropic_final(model))
 
     app.router.add_get("/v1/models", models)
@@ -227,7 +268,7 @@ async def t1_openai_tool_loop(sess):
     if len(entries) == 3:
         r1, r2, r3 = (e["body"] for e in entries)
         t1 = [(t.get("function") or {}).get("name") for t in r1.get("tools", []) if isinstance(t, dict)]
-        check("T1 r1 builtin tools injected", t1 == ["web_search", "web_fetch"], t1)
+        check("T1 r1 builtin tools injected", t1 == ["uri_search", "uri_fetch"], t1)
         check("T1 r1 stream forced off", r1.get("stream") is False, r1.get("stream"))
         check("T1 r1 model rewritten", r1.get("model") == "fake-model", r1.get("model"))
         m2 = r2.get("messages", [])
@@ -269,6 +310,9 @@ async def t2_openai_stream(sess):
                 finish = ch["finish_reason"]
     content = "".join(parts)
     check("T2 streamed final answer", "FINAL-ANSWER-OK" in content, content[:200])
+    check("T2 tool trace details", '<details type="tool_calls" done="true"' in content, content[:300])
+    check("T2 tool trace search", 'name="uri_search"' in content, content[:300])
+    check("T2 tool trace fetch", 'name="uri_fetch"' in content, content[:300])
     check("T2 finish stop", finish == "stop", finish)
     check("T2 3 backend rounds", len(find_marker(marker, "/v1/chat/completions")) == 3)
 
@@ -289,7 +333,7 @@ async def t3_anthropic_tool_loop(sess):
     if len(entries) == 3:
         r1, r2, r3 = (e["body"] for e in entries)
         check("T3 r1 anthropic tools",
-              [t.get("name") for t in r1.get("tools", [])] == ["web_search", "web_fetch"],
+              [t.get("name") for t in r1.get("tools", [])] == ["uri_search", "uri_fetch"],
               [t.get("name") for t in r1.get("tools", [])])
         check("T3 r1 input_schema shape", all("input_schema" in t for t in r1.get("tools", [])))
         m2 = r2.get("messages", [])
@@ -313,7 +357,7 @@ async def t4_plain_passthrough(sess):
     tc = body.get("choices", [{}])[0].get("message", {}).get("tool_calls")
     check("T4 status 200", status == 200, text[:200])
     check("T4 raw tool_calls passed through",
-          bool(tc) and tc[0].get("function", {}).get("name") == "web_search", text[:200])
+          bool(tc) and tc[0].get("function", {}).get("name") == "uri_search", text[:200])
     entries = find_marker(marker, "/v1/chat/completions")
     check("T4 single backend call", len(entries) == 1, len(entries))
     check("T4 no tools injected", "tools" not in entries[0]["body"] if entries else False)
@@ -430,6 +474,7 @@ async def t9_units():
 
     proxy = m.MicroLLM.__new__(m.MicroLLM)
     proxy.session = aiohttp.ClientSession()
+    proxy.web_fetch_url = None
     try:
         res = await proxy._web_fetch("http://127.0.0.1:18191/search?q=x")
         check("T9 web_fetch loopback refused", res.startswith("Error: URL not allowed"), res[:120])
