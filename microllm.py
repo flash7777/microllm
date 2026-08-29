@@ -1431,7 +1431,9 @@ class MicroLLM:
 
     async def _search_searxng(self, query, max_results):
         """Search via SearXNG JSON API."""
-        params = f"?q={query}&format=json&engines=google,bing,duckduckgo&max_results={max_results}"
+        # brandis: google/duckduckgo sind von der Pod-Egress-IP gebannt (CSE-Rate-Limit, CAPTCHA/403).
+        # qwant+mojeek liefern relevante deutsche Ergebnisse; bing/startpage/brave als Reserve.
+        params = f"?q={query}&format=json&engines=qwant,mojeek,startpage,brave,bing&max_results={max_results}"
         url = f"{self.web_search_url}/search{params}"
         async with self.session.get(url, timeout=ClientTimeout(total=15)) as resp:
             if resp.status == 200:
@@ -2660,6 +2662,10 @@ class MicroLLM:
                 choice = (final_resp.get("choices") or [{}])[0]
                 message = choice.get("message", {}) or {}
                 text = message.get("content") or ""
+                # vLLM (enable_thinking): content ist null, die Antwort liegt im
+                # reasoning-Feld -> ohne Fallback antwortet das Model mit leer.
+                if not text:
+                    text = message.get("reasoning") or ""
                 chunk_id = f"chatcmpl_toolloop_{int(time.time())}"
                 created = int(time.time())
                 base = {"id": chunk_id, "object": "chat.completion.chunk",
