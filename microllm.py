@@ -954,43 +954,70 @@ class MicroLLM:
                 status=400,
             )
 
-        route = self.pick_backend(model_name)
-        if not route:
-            return web.json_response({"error": f"No healthy backend for {model_name}"}, status=502)
-
-        url = f"{route['api_base']}{request.path}"
-        qs = request.query_string
-        if qs:
-            url += f"?{qs}"
-
-        headers = {}
-        for key, val in request.headers.items():
-            if key.lower() not in ("host", "transfer-encoding"):
-                headers[key] = val
-
         client_ip = self._client_ip(request)
         self.stats[model_name]["requests"] += 1
         t0 = time.monotonic()
 
-        try:
-            sem = self.get_backend_semaphore(route["api_base"])
-            async with sem, self.session.request(
-                request.method, url, data=body_raw, headers=headers,
-                timeout=ClientTimeout(total=600),
-            ) as resp:
-                resp_body = await resp.read()
-                elapsed = time.monotonic() - t0
-                self.mark_success(model_name, route)
-                self.stats[model_name]["total_gen_s"] += elapsed
-                ct = resp.headers.get("content-type", "application/json").split(";")[0].strip()
-                self._log(model_name, f"pt:{resp.status}", elapsed, client_ip)
-                pt_resp = web.Response(body=resp_body, status=resp.status, content_type=ct)
-                pt_resp.headers["X-Backend"] = route["api_base"]
-                return pt_resp
-        except Exception as e:
-            self.mark_failed(model_name, route)
-            self.stats[model_name]["errors"] += 1
-            return web.json_response({"error": f"Backend failed: {e}"}, status=502)
+        # Try backends with failover (same pattern as the JSON handler)
+        backends = self.routes[model_name]
+        max_tries = len(backends)
+        failed_ids = set()
+        last_error = None
+
+        for attempt in range(max_tries):
+            candidates = [b for b in backends if b["api_base"] not in failed_ids]
+            if not candidates:
+                break
+            # Prefer healthy backends with most free slots (least-connections).
+            # If none healthy (all in cooldown), fall back to any candidate.
+            healthy = [b for b in candidates if self._is_healthy(b)]
+            pool = healthy if healthy else candidates
+            best, best_free = None, -1
+            for b in pool:
+                sem = self.backend_semaphores.get(b["api_base"])
+                free = sem._value if sem is not None else (b.get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND)
+                if free > best_free:
+                    best, best_free = b, free
+            route = best
+
+            url = f"{route['api_base']}{request.path}"
+            qs = request.query_string
+            if qs:
+                url += f"?{qs}"
+
+            headers = {}
+            for key, val in request.headers.items():
+                if key.lower() not in ("host", "transfer-encoding"):
+                    headers[key] = val
+            headers["Content-Length"] = str(len(body_raw))
+
+            try:
+                sem = self.get_backend_semaphore(route["api_base"])
+                async with sem, self.session.request(
+                    request.method, url, data=body_raw, headers=headers,
+                    timeout=ClientTimeout(total=600),
+                ) as resp:
+                    resp_body = await resp.read()
+                    elapsed = time.monotonic() - t0
+                    self.mark_success(model_name, route)
+                    self.stats[model_name]["total_gen_s"] += elapsed
+                    self._log(model_name, f"pt:{resp.status}", elapsed, client_ip)
+                    pt_resp = web.Response(body=resp_body, status=resp.status,
+                                            content_type=resp.headers.get("content-type", "application/json").split(";")[0].strip())
+                    pt_resp.headers["X-Backend"] = route["api_base"]
+                    return pt_resp
+            except Exception as e:
+                self.mark_failed(model_name, route)
+                failed_ids.add(route["api_base"])
+                last_error = e
+                if max_tries > 1:
+                    print(f"  {model_name}: passthrough backend {route['api_base']} failed ({e}), "
+                          f"trying next ({attempt+1}/{max_tries})", flush=True)
+
+        self.stats[model_name]["errors"] += 1
+        return web.json_response(
+            {"error": f"All backends failed: {last_error}"}, status=502,
+        )
 
     # --- Service proxy (generic HTTP, multipart, round-robin) ---
 
