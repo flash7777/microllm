@@ -454,7 +454,9 @@ async def t5_pdf_openai_input_file(sess):
         check("T5 backend saw request", False)
         return
     r1 = entries[0]["body"]
-    uc = r1["messages"][0]["content"]
+    msgs = r1["messages"]
+    first_user = next(m for m in msgs if m.get("role") == "user")
+    uc = first_user["content"]
     types = [b.get("type") for b in uc]
     check("T5 block order text,image,text", types == ["text", "image_url", "text"], types)
     check("T5 page markers", "[Seite 1/2]" in uc[0]["text"] and "[Seite 2/2]" in uc[0]["text"],
@@ -482,7 +484,9 @@ async def t6_pdf_anthropic_document(sess):
     if not entries:
         check("T6 backend saw request", False)
         return
-    uc = entries[0]["body"]["messages"][0]["content"]
+    msgs6 = entries[0]["body"]["messages"]
+    first_user6 = next(m for m in msgs6 if m.get("role") == "user")
+    uc = first_user6["content"]
     types = [b.get("type") for b in uc]
     check("T6 block order text,image,text", types == ["text", "image", "text"], types)
     check("T6 page markers", "[Seite 1/2]" in uc[0]["text"], uc[0]["text"][:120])
@@ -506,7 +510,9 @@ async def t7_pdf_fallback_tika_text(sess):
     if not entries:
         check("T7 backend saw request", False)
         return
-    uc = entries[0]["body"]["messages"][0]["content"]
+    msgs7 = entries[0]["body"]["messages"]
+    first_user7 = next(m for m in msgs7 if m.get("role") == "user")
+    uc = first_user7["content"]
     types = [b.get("type") for b in uc]
     check("T7 text + user text only", types == ["text", "text"], types)
     check("T7 fallback text", "fallback text" in uc[0]["text"], uc[0]["text"][:160])
@@ -727,6 +733,79 @@ async def t14_pdf_units():
         await runner.cleanup()
 
 
+async def t15_builtin_system_prompt(sess):
+    print("T15: builtin_system_prompt injected into system context (all rounds, both formats)")
+    marker = "MK-T15"
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "testgroup", "stream": False,
+        "messages": [{"role": "user", "content": f"Hallo {marker}"}]})
+    check("T15 status 200", status == 200, text[:200])
+    entries = find_marker(marker, "/v1/chat/completions")
+    check("T15 3 backend rounds", len(entries) == 3, len(entries))
+    if len(entries) == 3:
+        for i, e in enumerate(entries, 1):
+            msgs = e["body"].get("messages", [])
+            sysmsgs = [m for m in msgs if m.get("role") == "system"]
+            check(f"T15 openai r{i} has system msg", len(sysmsgs) == 1, len(sysmsgs))
+            if sysmsgs:
+                c = sysmsgs[0].get("content")
+                check(f"T15 openai r{i} marker in system",
+                      isinstance(c, str) and "BUILTIN-SP-MARKER" in c, str(c)[:120])
+
+    marker = "MK-T15B"
+    status, _ct, text = await post(sess, "/v1/messages", {
+        "model": "testgroup",
+        "messages": [{"role": "user", "content": f"Hallo {marker}"}]})
+    check("T15B status 200", status == 200, text[:200])
+    entries = find_marker(marker, "/v1/messages")
+    check("T15B 3 backend rounds", len(entries) == 3, len(entries))
+    if len(entries) == 3:
+        for i, e in enumerate(entries, 1):
+            body = e["body"]
+            sysc = body.get("system")
+            ok = (isinstance(sysc, str) and "BUILTIN-SP-MARKER" in sysc) or (
+                isinstance(sysc, list) and any(
+                    isinstance(b, dict) and "BUILTIN-SP-MARKER" in b.get("text", "")
+                    for b in sysc))
+            check(f"T15B anthropic r{i} marker in system", ok, str(sysc)[:120])
+
+    # alias inherits the prompt
+    marker = "MK-T15C"
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "testalias", "stream": False,
+        "messages": [{"role": "user", "content": f"Hallo {marker}"}]})
+    entries = find_marker(marker, "/v1/chat/completions")
+    ok = False
+    if entries:
+        msgs = entries[0]["body"].get("messages", [])
+        ok = any(m.get("role") == "system" and "BUILTIN-SP-MARKER" in str(m.get("content", ""))
+                 for m in msgs)
+    check("T15C alias inherits system prompt", ok, text[:120])
+
+    # unit: append to existing system message instead of inserting a second one
+    sys.path.insert(0, REPO)
+    import microllm as m
+    data = {"messages": [{"role": "system", "content": "EXISTING"},
+                         {"role": "user", "content": "hi"}]}
+    injected = m.MicroLLM._inject_builtin_system_prompt(
+        data, {"builtin_system_prompt": "NEW-RULES"}, False)
+    check("T15 unit returns True", injected is True)
+    check("T15 unit single system msg",
+          len([x for x in data["messages"] if x["role"] == "system"]) == 1, data["messages"][:2])
+    check("T15 unit appended to existing",
+          data["messages"][0]["content"] == "EXISTING\n\nNEW-RULES", data["messages"][0]["content"])
+    data2 = {"messages": [{"role": "user", "content": "hi"}]}
+    m.MicroLLM._inject_builtin_system_prompt(data2, {"builtin_system_prompt": "R"}, False)
+    check("T15 unit inserts system when absent",
+          data2["messages"][0] == {"role": "system", "content": "R"}, data2["messages"][:1])
+    data3 = {}
+    check("T15 unit no messages -> no-op",
+          m.MicroLLM._inject_builtin_system_prompt(data3, {"builtin_system_prompt": "R"}, False) is False)
+    check("T15 unit empty prompt -> no-op",
+          m.MicroLLM._inject_builtin_system_prompt({"messages": [{"role": "user", "content": "x"}]},
+                                                   {"builtin_system_prompt": None}, False) is False)
+
+
 # ---------- main ----------
 
 async def main():
@@ -779,6 +858,7 @@ async def main():
             await t12_pdf_fetch_stream(sess)
             await t13_pdf_fetch_anthropic(sess)
             await t14_pdf_units()
+            await t15_builtin_system_prompt(sess)
     finally:
         proc.terminate()
         try:

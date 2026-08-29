@@ -250,7 +250,7 @@ class MicroLLM:
                 self.routes[name] = self.routes[target]
                 inherited = self.route_meta.get(target)
                 if inherited is not None:
-                    self.route_meta[name] = {"builtin": list(inherited["builtin"]), "pdf": dict(inherited["pdf"])}
+                    self.route_meta[name] = self._inherit_group_meta(inherited)
                 self._apply_group_meta(name, entry)
                 alias_names.add(name)
                 print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)")
@@ -284,13 +284,23 @@ class MicroLLM:
     def _default_pdf_meta():
         return {"enabled": True, "images": False, "vision": False, "vector": False, "dpi": 100, "max_image_pages": 8}
 
+    @staticmethod
+    def _default_group_meta():
+        return {"builtin": [], "builtin_system_prompt": None, "pdf": MicroLLM._default_pdf_meta()}
+
+    @staticmethod
+    def _inherit_group_meta(inherited):
+        return {"builtin": list(inherited.get("builtin") or []),
+                "builtin_system_prompt": inherited.get("builtin_system_prompt"),
+                "pdf": dict(inherited.get("pdf") or MicroLLM._default_pdf_meta())}
+
     def _apply_group_meta(self, name, entry, store=None, flush=False):
-        """Merge builtin/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
+        """Merge builtin/builtin_system_prompt/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
         store = store if store is not None else self.route_meta
-        if "builtin" not in entry and "pdf" not in entry:
+        if "builtin" not in entry and "builtin_system_prompt" not in entry and "pdf" not in entry:
             return
         if name not in store or store[name] is None:
-            store[name] = {"builtin": [], "pdf": self._default_pdf_meta()}
+            store[name] = self._default_group_meta()
         meta = store[name]
         if "builtin" in entry:
             builtin = entry["builtin"]
@@ -300,10 +310,17 @@ class MicroLLM:
                 print(f"  ! {name}: conflicting builtin lists, keeping {meta['builtin']}", flush=flush)
             else:
                 meta["builtin"] = list(builtin)
+        if "builtin_system_prompt" in entry:
+            prompt = entry["builtin_system_prompt"]
+            if prompt is not None and not isinstance(prompt, str):
+                print(f"  ! {name}: builtin_system_prompt must be a string, ignored", flush=flush)
+            else:
+                meta["builtin_system_prompt"] = prompt
         if "pdf" in entry:
             meta["pdf"].update(entry["pdf"])
         if meta["builtin"]:
-            print(f"  {name:20s} builtin={meta['builtin']}  pdf={meta['pdf']}", flush=flush)
+            extra = "  system_prompt" if meta.get("builtin_system_prompt") else ""
+            print(f"  {name:20s} builtin={meta['builtin']}{extra}  pdf={meta['pdf']}", flush=flush)
 
     def reload_config(self):
         """Hot-reload config: merge new backends into existing groups, remove stale ones.
@@ -375,7 +392,7 @@ class MicroLLM:
         new_meta = {}
         for entry in config.get("model_list", []):
             name = entry.get("model_name")
-            if name and ("builtin" in entry or "pdf" in entry):
+            if name and ("builtin" in entry or "builtin_system_prompt" in entry or "pdf" in entry):
                 self._apply_group_meta(name, entry, store=new_meta, flush=True)
 
         # Parse new service backends
@@ -452,7 +469,7 @@ class MicroLLM:
                 self.routes[name] = self.routes[target]
                 inherited = self.route_meta.get(target)
                 if inherited is not None and name not in new_meta:
-                    self.route_meta[name] = {"builtin": list(inherited["builtin"]), "pdf": dict(inherited["pdf"])}
+                    self.route_meta[name] = self._inherit_group_meta(inherited)
                 print(f"  ~ alias: {name} -> {target} ({len(self.routes[target])} backends)", flush=True)
             else:
                 if name in self.routes and not any(
@@ -1586,6 +1603,41 @@ class MicroLLM:
         message = (resp_json.get("choices") or [{}])[0].get("message", {}) or {}
         return bool((message.get("content") or "").strip())
 
+    @staticmethod
+    def _inject_builtin_system_prompt(data, group_meta, is_anthropic):
+        """Append the group's builtin_system_prompt to the system context.
+
+        Tool descriptions alone are followed unreliably by small models; the
+        same rules in the system position are. Returns True if injected.
+        """
+        prompt = (group_meta or {}).get("builtin_system_prompt")
+        if not prompt:
+            return False
+        if is_anthropic:
+            system = data.get("system")
+            if isinstance(system, list):
+                system.append({"type": "text", "text": f"\n\n{prompt}"})
+            elif isinstance(system, str):
+                data["system"] = system + f"\n\n{prompt}"
+            else:
+                data["system"] = prompt
+        else:
+            messages = data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                return False
+            first = messages[0]
+            if isinstance(first, dict) and first.get("role") == "system":
+                content = first.get("content")
+                if isinstance(content, str):
+                    first["content"] = content + f"\n\n{prompt}"
+                elif isinstance(content, list):
+                    content.append({"type": "text", "text": f"\n\n{prompt}"})
+                else:
+                    first["content"] = prompt
+            else:
+                messages.insert(0, {"role": "system", "content": prompt})
+        return True
+
     async def _run_tool_loop(self, request, data, model_name, group_meta):
         """Execute builtin tools (web_search/web_fetch) server-side in a loop.
 
@@ -1623,6 +1675,8 @@ class MicroLLM:
         injected = self._tool_definitions(is_anthropic, builtin_names)
         if injected:
             data["tools"] = list(data.get("tools") or []) + injected
+        if self._inject_builtin_system_prompt(data, group_meta, is_anthropic):
+            print(f"  {model_name}: builtin system prompt injected", flush=True)
 
         client_ip = self._client_ip(request)
         t0 = time.monotonic()
@@ -1827,6 +1881,8 @@ class MicroLLM:
         injected = self._tool_definitions(is_anthropic, builtin_names)
         if injected:
             data["tools"] = list(data.get("tools") or []) + injected
+        if self._inject_builtin_system_prompt(data, group_meta, is_anthropic):
+            print(f"  {model_name}: builtin system prompt injected", flush=True)
 
         client_ip = self._client_ip(request)
         t0 = time.monotonic()

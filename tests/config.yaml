@@ -11,6 +11,8 @@ general_settings:
 model_list:
   - model_name: testgroup
     builtin: [uri_search, uri_fetch]
+    builtin_system_prompt: |
+      BUILTIN-SP-MARKER: Recherche-Regeln (System-Position).
     pdf:
       enabled: true
       images: true
