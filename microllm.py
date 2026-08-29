@@ -2662,10 +2662,6 @@ class MicroLLM:
                 choice = (final_resp.get("choices") or [{}])[0]
                 message = choice.get("message", {}) or {}
                 text = message.get("content") or ""
-                # vLLM (enable_thinking): content ist null, die Antwort liegt im
-                # reasoning-Feld -> ohne Fallback antwortet das Model mit leer.
-                if not text:
-                    text = message.get("reasoning") or ""
                 chunk_id = f"chatcmpl_toolloop_{int(time.time())}"
                 created = int(time.time())
                 base = {"id": chunk_id, "object": "chat.completion.chunk",
