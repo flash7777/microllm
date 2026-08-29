@@ -980,14 +980,6 @@ class MicroLLM:
                     best, best_free = b, free
             route = best
 
-            # Translate alias model name to backend model name (same as JSON handler)
-            if "model" in route and route["model"] != model_name:
-                body_raw = body_raw.replace(
-                    (b'name="model"\r\n\r\n' + model_name.encode()),
-                    (b'name="model"\r\n\r\n' + route["model"].encode()),
-                    1,
-                )
-
             url = f"{route['api_base']}{request.path}"
             qs = request.query_string
             if qs:
