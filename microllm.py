@@ -1704,6 +1704,14 @@ class MicroLLM:
                 send_data["tools"] = list(data.get("tools") or [])
             else:
                 send_data.pop("tools", None)
+                # Final round: nudge the model to answer from the material it
+                # already gathered instead of going silent (27B models
+                # frequently return empty content when forced without tools).
+                send_data["messages"] = list(data.get("messages") or []) + [
+                    {"role": "user",
+                     "content": "Fasse deine bisherigen Rechercheergebnisse zusammen und "
+                                "antworte jetzt. Nenne fuer jede Angabe die URL. Was nicht "
+                                "ermittelt werden konnte, als 'nicht ermittelt' melden."}]
 
             self.chatlog_seq += 1
             round_seq = self.chatlog_seq
@@ -1953,6 +1961,14 @@ class MicroLLM:
                 send_data["tools"] = list(data.get("tools") or [])
             else:
                 send_data.pop("tools", None)
+                # Final round: nudge the model to answer from the material it
+                # already gathered instead of going silent (27B models
+                # frequently return empty content when forced without tools).
+                send_data["messages"] = list(data.get("messages") or []) + [
+                    {"role": "user",
+                     "content": "Fasse deine bisherigen Rechercheergebnisse zusammen und "
+                                "antworte jetzt. Nenne fuer jede Angabe die URL. Was nicht "
+                                "ermittelt werden konnte, als 'nicht ermittelt' melden."}]
 
             try:
                 resp_json = await self._tool_loop_backend_call(

@@ -353,6 +353,10 @@ async def t1_openai_tool_loop(sess):
         check("T1 r3 has fetch result",
               any(str(m.get("content", "")).startswith("Content of")
                   for m in r3.get("messages", []) if m.get("role") == "tool"))
+        r3_user_msgs = [m for m in r3.get("messages", []) if m.get("role") == "user"]
+        check("T1 r3 final-answer nudge present",
+              any("antworte jetzt" in str(m.get("content", "")) for m in r3_user_msgs),
+              [str(m.get("content", ""))[:60] for m in r3_user_msgs])
     files = os.listdir(CHATLOG) if os.path.isdir(CHATLOG) else []
     check("T1 chatlog round files",
           any("req_r1" in f for f in files) and any("req_r3" in f for f in files), files[:10])
@@ -421,6 +425,10 @@ async def t3_anthropic_tool_loop(sess):
                   and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])
                   for m in m2))
         check("T3 r3 tools dropped", "tools" not in r3, list(r3.keys()))
+        r3_user_msgs = [m for m in r3.get("messages", []) if m.get("role") == "user"]
+        check("T3 r3 final-answer nudge present",
+              any("antworte jetzt" in str(m.get("content", "")) for m in r3_user_msgs),
+              [str(m.get("content", ""))[:60] for m in r3_user_msgs])
 
 
 async def t4_plain_passthrough(sess):
