@@ -92,6 +92,15 @@ model_list:
       api_base: http://10.30.10.111:8013/v1
       api_key: dummy-key
       max_model_len: 256000
+    builtin:
+      - uri_search
+      - uri_fetch
+    pdf:
+      enabled: true
+      images: true
+      vision: true
+      dpi: 100
+      max_image_pages: 70
 
   # ── local2 → Qwen3.8 ──
   - model_name: local2
