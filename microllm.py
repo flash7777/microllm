@@ -1845,8 +1845,15 @@ class MicroLLM:
             base = {"id": f"chatcmpl_tc_{int(time.time() * 1000)}",
                     "object": "chat.completion.chunk", "created": int(time.time()),
                     "model": model_name}
+            # Emit the details block in its own chunk, followed by a newline
+            # chunk. Open WebUI's streaming re-lexer only processes content
+            # up to the last \n — the details block must be complete at a
+            # newline boundary or it won't be parsed as a tool_calls token.
             await self._sse_write(sse_response, None, {
                 **base, "choices": [{"index": 0, "delta": {"content": details},
+                                     "finish_reason": None}]})
+            await self._sse_write(sse_response, None, {
+                **base, "choices": [{"index": 0, "delta": {"content": "\n\n"},
                                      "finish_reason": None}]})
             return next_index
         except (ConnectionResetError, ConnectionError):
