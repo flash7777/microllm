@@ -7,6 +7,54 @@ general_settings:
   web_search_url: duckduckgo
   web_fetch_url: http://10.89.1.1:8899   # open_fetch service (bot-safe uri_fetch)
 
+  # Tool-Definitionen (ueberschreiben Defaults aus microllm.py)
+  builtin_tool_defs:
+    uri_search:
+      description: |
+        Search the web. Returns a numbered list of results with title, URL and snippet.
+        Recherche-Regeln (gelten fuer jede Suchaufgabe):
+        1. Reihenfolge: Unbekannte Begriffe zuerst klaeren (eigene Anfrage nur mit dem Begriff),
+           dann erst die eigentliche Frage bearbeiten.
+        2. Schreibe nie eine eigene Vermutung in die Suchanfrage. Vermutungen werden geprueft, nicht mitgesucht.
+        3. Keine Fuellwoerter (Liste, Uebersicht, alle, komplett).
+        4. Verfeinere erst nach einem brauchbaren Treffer, und immer nur um einen Term.
+        5. Kommt der gesuchte Begriff in keinem Ergebnis vor, ist die ANFRAGE falsch, nicht die Suchmaschine.
+           Zurueck zu Regel 1. Nicht weiter spezialisieren.
+        6. Nach zwei erfolglosen Anfragen: Stopp. Melden dass der Begriff nicht aufoesbar ist.
+           Niemals Alternativen raten.
+        7. Eine einmal verworfene Annahme wird nicht in einer spaeteren Anfrage wiederverwendet.
+        8. Jede Aussage im Ergebnis bekommt eine URL. Ohne URL wird die Aussage nicht ausgegeben.
+        9. Fehlt ein Wert, schreiben 'nicht ermittelt'. Niemals schaetzen oder ergaenzen.
+        10. Voellige Quellen: amtliche Register und Behoerdenseiten vor Wikipedia, Wikipedia vor allem anderen.
+            Keine Foren, kein Social Media.
+        11. Ausgabe: erst Tabelle mit Quelle je Zeile, dann kurze Liste der offenen Punkte.
+        Fuer technische Fragen (Hardware, Protokolle), 'manual', 'specification', 'datasheet' oder 'pdf' in die Query.
+      parameters:
+        type: object
+        properties:
+          query:
+            type: string
+            description: The search query
+          max_results:
+            type: integer
+            description: Maximum number of results (default 5)
+        required: [query]
+    uri_fetch:
+      description: |
+        Fetch a web page and return its content as text. PDF files are
+        processed: the result contains the extracted text plus page figures.
+        ALWAYS use uri_fetch to read a URL from uri_search results before
+        answering — search snippets are not enough for technical details.
+        If the fetched page is a product landing page without specs,
+        try fetching the manual/datasheet URL instead.
+      parameters:
+        type: object
+        properties:
+          url:
+            type: string
+            description: Absolute URL to fetch (http/https)
+        required: [url]
+
 service_list:
   - service_name: steno-ml
     api_base: http://10.30.254.81:8090

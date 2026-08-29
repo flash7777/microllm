@@ -152,6 +152,30 @@ class MicroLLM:
             os.makedirs(self.chatlog_dir, exist_ok=True)
             print(f"microllm: chatlog -> {self.chatlog_dir}")
 
+        # builtin_tool_defs: pro Instanz ueberschreibbare Tool-Definitionen
+        # Format: {tool_name: {description: str, parameters: schema}}
+        # Fehlende Tools behalten den Default aus BUILTIN_TOOL_DEFS.
+        tool_defs_from_config = settings.get("builtin_tool_defs", None)
+        if tool_defs_from_config:
+            merged = {}
+            for name, (default_desc, default_schema) in self.BUILTIN_TOOL_DEFS.items():
+                override = tool_defs_from_config.get(name, None)
+                if override:
+                    desc = override.get("description", default_desc)
+                    schema = override.get("parameters", default_schema)
+                else:
+                    desc, schema = default_desc, default_schema
+                merged[name] = (desc, schema)
+            # Neue Tools aus der Config, die im Default nicht existieren
+            for name, override in tool_defs_from_config.items():
+                if name not in self.BUILTIN_TOOL_DEFS and name not in merged:
+                    merged[name] = (
+                        override.get("description", ""),
+                        override.get("parameters", {}),
+                    )
+            self.BUILTIN_TOOL_DEFS = merged
+            print(f"microllm: builtin_tool_defs ueberschrieben: {list(merged.keys())}", flush=True)
+
         # Pass 1: concrete backends (alias_of entries are resolved in pass 2)
         alias_entries = []
         for entry in config.get("model_list", []):
@@ -1496,26 +1520,13 @@ class MicroLLM:
 
     # --- Builtin Tool Executor (per alias group: web_search, web_fetch) ---
 
+    # Default-Definitionen; werden durch general_settings.builtin_tool_defs in der
+    # Config-Datei ueberschrieben (pro Instanz anpassbar).
     BUILTIN_TOOL_DEFS = {
         "uri_search": (
-            "Search the web. Returns a numbered list of results with title, URL and snippet.\n"
-            "Recherche-Regeln (gelten fuer jede Suchaufgabe):\n"
-            "1. Reihenfolge: Unbekannte Begriffe zuerst klaeren (eigene Anfrage nur mit dem Begriff), "
-            "dann erst die eigentliche Frage bearbeiten.\n"
-            "2. Schreibe nie eine eigene Vermutung in die Suchanfrage. Vermutungen werden geprueft, nicht mitgesucht.\n"
-            "3. Keine Fuellwoerter (Liste, Uebersicht, alle, komplett).\n"
-            "4. Verfeinere erst nach einem brauchbaren Treffer, und immer nur um einen Term.\n"
-            "5. Kommt der gesuchte Begriff in keinem Ergebnis vor, ist die ANFRAGE falsch, nicht die Suchmaschine. "
-            "Zurueck zu Regel 1. Nicht weiter spezialisieren.\n"
-            "6. Nach zwei erfolglosen Anfragen: Stopp. Melden dass der Begriff nicht aufoesbar ist. "
-            "Niemals Alternativen raten.\n"
-            "7. Eine einmal verworfene Annahme wird nicht in einer spaeteren Anfrage wiederverwendet.\n"
-            "8. Jede Aussage im Ergebnis bekommt eine URL. Ohne URL wird die Aussage nicht ausgegeben.\n"
-            "9. Fehlt ein Wert, schreiben 'nicht ermittelt'. Niemals schaetzen oder ergaenzen.\n"
-            "10. Voellige Quellen: amtliche Register und Behoerdenseiten vor Wikipedia, Wikipedia vor allem anderen. "
-            "Keine Foren, kein Social Media.\n"
-            "11. Ausgabe: erst Tabelle mit Quelle je Zeile, dann kurze Liste der offenen Punkte.\n"
-            "Fuer technische Fragen (Hardware, Protokolle), 'manual', 'specification', 'datasheet' oder 'pdf' in die Query.",
+            "Search the web. Returns a numbered list of results with title, URL and snippet. "
+            "For technical questions (hardware specs, connections, protocols), include "
+            "'manual', 'specification', 'datasheet' or 'pdf' in the query.",
             {"type": "object", "properties": {
                 "query": {"type": "string", "description": "The search query"},
                 "max_results": {"type": "integer", "description": "Maximum number of results (default 5)"},
