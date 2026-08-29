@@ -1465,7 +1465,7 @@ class MicroLLM:
         """Search via SearXNG JSON API."""
         # brandis: google/duckduckgo sind von der Pod-Egress-IP gebannt (CSE-Rate-Limit, CAPTCHA/403).
         # qwant+mojeek liefern relevante deutsche Ergebnisse; bing/startpage/brave als Reserve.
-        params = f"?q={query}&format=json&engines=qwant,mojeek,startpage,brave,bing&max_results={max_results}"
+        params = f"?q={query}&format=json&engines=qwant,mojeek,brave&max_results={max_results}"
         url = f"{self.web_search_url}/search{params}"
         async with self.session.get(url, timeout=ClientTimeout(total=15)) as resp:
             if resp.status == 200:
