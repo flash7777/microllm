@@ -1498,9 +1498,24 @@ class MicroLLM:
 
     BUILTIN_TOOL_DEFS = {
         "uri_search": (
-            "Search the web. Returns a numbered list of results with title, URL and snippet. "
-            "For technical questions (hardware specs, connections, protocols), include "
-            "'manual', 'specification', 'datasheet' or 'pdf' in the query.",
+            "Search the web. Returns a numbered list of results with title, URL and snippet.\n"
+            "Recherche-Regeln (gelten fuer jede Suchaufgabe):\n"
+            "1. Reihenfolge: Unbekannte Begriffe zuerst klaeren (eigene Anfrage nur mit dem Begriff), "
+            "dann erst die eigentliche Frage bearbeiten.\n"
+            "2. Schreibe nie eine eigene Vermutung in die Suchanfrage. Vermutungen werden geprueft, nicht mitgesucht.\n"
+            "3. Keine Fuellwoerter (Liste, Uebersicht, alle, komplett).\n"
+            "4. Verfeinere erst nach einem brauchbaren Treffer, und immer nur um einen Term.\n"
+            "5. Kommt der gesuchte Begriff in keinem Ergebnis vor, ist die ANFRAGE falsch, nicht die Suchmaschine. "
+            "Zurueck zu Regel 1. Nicht weiter spezialisieren.\n"
+            "6. Nach zwei erfolglosen Anfragen: Stopp. Melden dass der Begriff nicht aufoesbar ist. "
+            "Niemals Alternativen raten.\n"
+            "7. Eine einmal verworfene Annahme wird nicht in einer spaeteren Anfrage wiederverwendet.\n"
+            "8. Jede Aussage im Ergebnis bekommt eine URL. Ohne URL wird die Aussage nicht ausgegeben.\n"
+            "9. Fehlt ein Wert, schreiben 'nicht ermittelt'. Niemals schaetzen oder ergaenzen.\n"
+            "10. Voellige Quellen: amtliche Register und Behoerdenseiten vor Wikipedia, Wikipedia vor allem anderen. "
+            "Keine Foren, kein Social Media.\n"
+            "11. Ausgabe: erst Tabelle mit Quelle je Zeile, dann kurze Liste der offenen Punkte.\n"
+            "Fuer technische Fragen (Hardware, Protokolle), 'manual', 'specification', 'datasheet' oder 'pdf' in die Query.",
             {"type": "object", "properties": {
                 "query": {"type": "string", "description": "The search query"},
                 "max_results": {"type": "integer", "description": "Maximum number of results (default 5)"},
