@@ -1941,6 +1941,56 @@ class MicroLLM:
             return sse_response
 
         # --- Phase 4: Emit follow-up answer on the existing SSE stream ---
+        if not self._final_answer_text(final_resp, is_anthropic):
+            print(f"  {model_name}: streaming tool loop ended with empty answer, "
+                  f"sending explicit notice", flush=True)
+            try:
+                if is_anthropic:
+                    await self._sse_write(sse_response, "content_block_start", {
+                        "type": "content_block_start", "index": anthropic_next_index,
+                        "content_block": {"type": "text", "text": ""}})
+                    await self._sse_write(sse_response, "content_block_delta", {
+                        "type": "content_block_delta", "index": anthropic_next_index,
+                        "delta": {"type": "text_delta",
+                                  "text": ("Die Recherche ist nach 3 Runden ohne "
+                                           "Ergebnis geblieben. Die gefundenen "
+                                           "Quellen enthielten keine verwertbaren "
+                                           "Angaben - die Frage ist damit offen.")}})
+                    await self._sse_write(sse_response, "content_block_stop", {
+                        "type": "content_block_stop", "index": anthropic_next_index})
+                    await self._sse_write(sse_response, "message_delta", {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 0}})
+                    await self._sse_write(sse_response, "message_stop", {"type": "message_stop"})
+                else:
+                    chunk_id = f"chatcmpl_stl_{int(time.time())}"
+                    base = {"id": chunk_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": final_resp.get("model", model_name)}
+                    await self._sse_write(sse_response, None, {
+                        **base, "choices": [{"index": 0,
+                                             "delta": {"content": ("Die Recherche ist "
+                                                                    "nach 3 Runden ohne Ergebnis "
+                                                                    "geblieben. Die gefundenen "
+                                                                    "Quellen enthielten keine "
+                                                                    "verwertbaren Angaben - die "
+                                                                    "Frage ist damit offen.")},
+                                             "finish_reason": None}]})
+                    await self._sse_write(sse_response, None, {
+                        **base, "choices": [{"index": 0, "delta": {},
+                                             "finish_reason": "stop"}]})
+                    await sse_response.write(b"data: [DONE]\n\n")
+            except (ConnectionResetError, ConnectionError):
+                pass
+            finally:
+                try:
+                    await sse_response.write_eof()
+                except Exception:
+                    pass
+            self._log(model_name, f"str+tools:{rounds_done}:empty", elapsed, client_ip)
+            return sse_response
+
         next_index = anthropic_next_index
         try:
             if is_anthropic:
