@@ -125,6 +125,32 @@ class MicroLLM:
             self.backend_semaphores[api_base] = asyncio.Semaphore(limit)
         return self.backend_semaphores[api_base]
 
+    def _apply_builtin_tool_defs(self, settings):
+        """Merge general_settings.builtin_tool_defs over the built-in defaults.
+        Format: {tool_name: {description: str, parameters: schema}}. Missing
+        tools keep the default; new tools from config are added."""
+        overrides = settings.get("builtin_tool_defs", None)
+        if not overrides:
+            return
+        merged = {}
+        for name, (default_desc, default_schema) in self.BUILTIN_TOOL_DEFS.items():
+            override = overrides.get(name, None)
+            if override:
+                desc = override.get("description", default_desc)
+                schema = override.get("parameters", default_schema)
+            else:
+                desc, schema = default_desc, default_schema
+            merged[name] = (desc, schema)
+        # Neue Tools aus der Config, die im Default nicht existieren
+        for name, override in overrides.items():
+            if name not in self.BUILTIN_TOOL_DEFS and name not in merged:
+                merged[name] = (
+                    override.get("description", ""),
+                    override.get("parameters", {}),
+                )
+        self.BUILTIN_TOOL_DEFS = merged
+        print(f"microllm: builtin_tool_defs ueberschrieben: {list(merged.keys())}", flush=True)
+
     def load_config(self, path):
         with open(path) as f:
             config = yaml.safe_load(f)
@@ -152,29 +178,8 @@ class MicroLLM:
             os.makedirs(self.chatlog_dir, exist_ok=True)
             print(f"microllm: chatlog -> {self.chatlog_dir}")
 
-        # builtin_tool_defs: pro Instanz ueberschreibbare Tool-Definitionen
-        # Format: {tool_name: {description: str, parameters: schema}}
-        # Fehlende Tools behalten den Default aus BUILTIN_TOOL_DEFS.
-        tool_defs_from_config = settings.get("builtin_tool_defs", None)
-        if tool_defs_from_config:
-            merged = {}
-            for name, (default_desc, default_schema) in self.BUILTIN_TOOL_DEFS.items():
-                override = tool_defs_from_config.get(name, None)
-                if override:
-                    desc = override.get("description", default_desc)
-                    schema = override.get("parameters", default_schema)
-                else:
-                    desc, schema = default_desc, default_schema
-                merged[name] = (desc, schema)
-            # Neue Tools aus der Config, die im Default nicht existieren
-            for name, override in tool_defs_from_config.items():
-                if name not in self.BUILTIN_TOOL_DEFS and name not in merged:
-                    merged[name] = (
-                        override.get("description", ""),
-                        override.get("parameters", {}),
-                    )
-            self.BUILTIN_TOOL_DEFS = merged
-            print(f"microllm: builtin_tool_defs ueberschrieben: {list(merged.keys())}", flush=True)
+        # Tool-Definitionen pro Instanz (general_settings.builtin_tool_defs)
+        self._apply_builtin_tool_defs(settings)
 
         # Pass 1: concrete backends (alias_of entries are resolved in pass 2)
         alias_entries = []
@@ -325,6 +330,9 @@ class MicroLLM:
         self.chatlog_dir = settings.get("chatlog_dir", None)
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
+
+        # Tool-Definitionen pro Instanz (general_settings.builtin_tool_defs)
+        self._apply_builtin_tool_defs(settings)
 
         # Parse new model backends (alias_of entries are resolved after merging)
         new_routes = {}
@@ -1568,6 +1576,16 @@ class MicroLLM:
                 })
         return defs
 
+    @staticmethod
+    def _final_answer_text(resp_json, is_anthropic):
+        """True if the final backend response carries actual answer text."""
+        if is_anthropic:
+            return any(isinstance(b, dict) and b.get("type") == "text"
+                       and (b.get("text") or "").strip()
+                       for b in resp_json.get("content", []))
+        message = (resp_json.get("choices") or [{}])[0].get("message", {}) or {}
+        return bool((message.get("content") or "").strip())
+
     async def _run_tool_loop(self, request, data, model_name, group_meta):
         """Execute builtin tools (web_search/web_fetch) server-side in a loop.
 
@@ -1679,7 +1697,20 @@ class MicroLLM:
                 return sse_response
             return web.json_response(error_body, status=502)
 
+        # Leere finale Antwort (content=null ohne tool_calls): statt null eine
+        # explizite Meldung an den Client, sonst sieht er eine tote Endung.
+        final_empty = not self._final_answer_text(final_resp, is_anthropic)
         self._log(model_name, f"tools:{rounds_done}", time.monotonic() - t0, client_ip)
+        if final_empty:
+            print(f"  {model_name}: tool loop ended with empty answer, "
+                  f"sending explicit notice", flush=True)
+            return await self._deliver_tool_loop_response(
+                request, final_resp, model_name, is_stream, is_anthropic, req_seq,
+                sse_response,
+                force_text=("Die Recherche ist nach 3 Runden ohne Ergebnis "
+                            "geblieben. Die gefundenen Quellen enthielten "
+                            "keine verwertbaren Angaben - die Frage ist damit "
+                            "offen."))
         return await self._deliver_tool_loop_response(
             request, final_resp, model_name, is_stream, is_anthropic, req_seq, sse_response)
 
@@ -2620,8 +2651,17 @@ class MicroLLM:
 
     async def _deliver_tool_loop_response(self, request, final_resp, model_name,
                                           is_stream, is_anthropic, req_seq,
-                                          sse_response=None):
+                                          sse_response=None, force_text=None):
         """Deliver the final tool-loop answer (JSON, or synthesized SSE if the client wanted a stream)."""
+        if force_text:
+            # Empty final answer: synthesize an explicit text response.
+            import copy as _copy
+            final_resp = _copy.deepcopy(final_resp)
+            if is_anthropic:
+                final_resp["content"] = [{"type": "text", "text": force_text}]
+            else:
+                message = (final_resp.get("choices") or [{}])[0].setdefault("message", {})
+                message["content"] = force_text
         if self.chatlog_dir:
             self._chatlog_write(req_seq, "resp", final_resp, model_name)
         if not is_stream:
