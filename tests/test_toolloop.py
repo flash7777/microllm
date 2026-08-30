@@ -741,8 +741,8 @@ async def t14_pdf_units():
         await runner.cleanup()
 
 
-async def t15_builtin_system_prompt(sess):
-    print("T15: builtin_system_prompt injected into system context (all rounds, both formats)")
+async def t15_system_prompt(sess):
+    print("T15: system_prompt injected into system context (all rounds, both formats)")
     marker = "MK-T15"
     status, _ct, text = await post(sess, "/v1/chat/completions", {
         "model": "testgroup", "stream": False,
@@ -795,23 +795,51 @@ async def t15_builtin_system_prompt(sess):
     import microllm as m
     data = {"messages": [{"role": "system", "content": "EXISTING"},
                          {"role": "user", "content": "hi"}]}
-    injected = m.MicroLLM._inject_builtin_system_prompt(
-        data, {"builtin_system_prompt": "NEW-RULES"}, False)
+    injected = m.MicroLLM._inject_system_prompt(
+        data, {"system_prompt": "NEW-RULES"}, False)
     check("T15 unit returns True", injected is True)
     check("T15 unit single system msg",
           len([x for x in data["messages"] if x["role"] == "system"]) == 1, data["messages"][:2])
     check("T15 unit appended to existing",
           data["messages"][0]["content"] == "EXISTING\n\nNEW-RULES", data["messages"][0]["content"])
     data2 = {"messages": [{"role": "user", "content": "hi"}]}
-    m.MicroLLM._inject_builtin_system_prompt(data2, {"builtin_system_prompt": "R"}, False)
+    m.MicroLLM._inject_system_prompt(data2, {"system_prompt": "R"}, False)
     check("T15 unit inserts system when absent",
           data2["messages"][0] == {"role": "system", "content": "R"}, data2["messages"][:1])
     data3 = {}
     check("T15 unit no messages -> no-op",
-          m.MicroLLM._inject_builtin_system_prompt(data3, {"builtin_system_prompt": "R"}, False) is False)
+          m.MicroLLM._inject_system_prompt(data3, {"system_prompt": "R"}, False) is False)
     check("T15 unit empty prompt -> no-op",
-          m.MicroLLM._inject_builtin_system_prompt({"messages": [{"role": "user", "content": "x"}]},
-                                                   {"builtin_system_prompt": None}, False) is False)
+          m.MicroLLM._inject_system_prompt({"messages": [{"role": "user", "content": "x"}]},
+                                           {"system_prompt": None}, False) is False)
+
+    # T15D: system_prompt WITHOUT builtin tools (passthrough path)
+    marker = "MK-T15D"
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "plainprompt", "stream": False,
+        "messages": [{"role": "user", "content": f"Hallo {marker}"}]})
+    check("T15D passthrough status 200", status == 200, text[:200])
+    entries = find_marker(marker, "/v1/chat/completions")
+    check("T15D 1 backend call", len(entries) == 1, len(entries))
+    if entries:
+        msgs = entries[0]["body"].get("messages", [])
+        ok = any(m.get("role") == "system" and "PLAIN-SP-MARKER" in str(m.get("content", ""))
+                 for m in msgs)
+        check("T15D system prompt injected in passthrough", ok, str(msgs)[:200])
+
+    # T15E: legacy key name (builtin_system_prompt) still works
+    marker = "MK-T15E"
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "legacyprompt", "stream": False,
+        "messages": [{"role": "user", "content": f"Hallo {marker}"}]})
+    check("T15E legacy key status 200", status == 200, text[:200])
+    entries = find_marker(marker, "/v1/chat/completions")
+    check("T15E 1 backend call", len(entries) == 1, len(entries))
+    if entries:
+        msgs = entries[0]["body"].get("messages", [])
+        ok = any(m.get("role") == "system" and "LEGACY-SP-MARKER" in str(m.get("content", ""))
+                 for m in msgs)
+        check("T15E legacy key still works", ok, str(msgs)[:200])
 
 
 # ---------- main ----------
@@ -866,7 +894,7 @@ async def main():
             await t12_pdf_fetch_stream(sess)
             await t13_pdf_fetch_anthropic(sess)
             await t14_pdf_units()
-            await t15_builtin_system_prompt(sess)
+            await t15_system_prompt(sess)
     finally:
         proc.terminate()
         try:

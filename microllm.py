@@ -101,7 +101,7 @@ class MicroLLM:
         self.config_path = config_path
         self.port = port
         self.routes = {}        # model_name -> [backend, ...]  (list for least-conn)
-        self.route_meta = {}    # model_name -> {"builtin": [...], "pdf": {...}}  (pro Alias-Gruppe)
+        self.route_meta = {}    # model_name -> {"builtin": [...], "system_prompt": ..., "pdf": {...}}  (pro Alias-Gruppe)
         self.alias_rules = []   # [(compiled_regex, target_group), ...]  (model_match entries)
         self.services = {}      # service_name -> [backend, ...]  (generic HTTP proxy)
         self.rr_index = defaultdict(int)  # model_name -> next backend index
@@ -286,18 +286,19 @@ class MicroLLM:
 
     @staticmethod
     def _default_group_meta():
-        return {"builtin": [], "builtin_system_prompt": None, "pdf": MicroLLM._default_pdf_meta()}
+        return {"builtin": [], "system_prompt": None, "pdf": MicroLLM._default_pdf_meta()}
 
     @staticmethod
     def _inherit_group_meta(inherited):
         return {"builtin": list(inherited.get("builtin") or []),
-                "builtin_system_prompt": inherited.get("builtin_system_prompt"),
+                "system_prompt": inherited.get("system_prompt"),
                 "pdf": dict(inherited.get("pdf") or MicroLLM._default_pdf_meta())}
 
     def _apply_group_meta(self, name, entry, store=None, flush=False):
-        """Merge builtin/builtin_system_prompt/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
+        """Merge builtin/system_prompt/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
         store = store if store is not None else self.route_meta
-        if "builtin" not in entry and "builtin_system_prompt" not in entry and "pdf" not in entry:
+        if "builtin" not in entry and "system_prompt" not in entry \
+                and "builtin_system_prompt" not in entry and "pdf" not in entry:
             return
         if name not in store or store[name] is None:
             store[name] = self._default_group_meta()
@@ -310,17 +311,21 @@ class MicroLLM:
                 print(f"  ! {name}: conflicting builtin lists, keeping {meta['builtin']}", flush=flush)
             else:
                 meta["builtin"] = list(builtin)
-        if "builtin_system_prompt" in entry:
-            prompt = entry["builtin_system_prompt"]
+        if "system_prompt" in entry or "builtin_system_prompt" in entry:
+            prompt = entry.get("system_prompt", entry.get("builtin_system_prompt"))
             if prompt is not None and not isinstance(prompt, str):
-                print(f"  ! {name}: builtin_system_prompt must be a string, ignored", flush=flush)
+                print(f"  ! {name}: system_prompt must be a string, ignored", flush=flush)
             else:
-                meta["builtin_system_prompt"] = prompt
+                meta["system_prompt"] = prompt
         if "pdf" in entry:
             meta["pdf"].update(entry["pdf"])
+        parts = []
         if meta["builtin"]:
-            extra = "  system_prompt" if meta.get("builtin_system_prompt") else ""
-            print(f"  {name:20s} builtin={meta['builtin']}{extra}  pdf={meta['pdf']}", flush=flush)
+            parts.append(f"builtin={meta['builtin']}")
+        if meta.get("system_prompt"):
+            parts.append("system_prompt")
+        parts.append(f"pdf={meta['pdf']}")
+        print(f"  {name:20s} {'  '.join(parts)}", flush=flush)
 
     def reload_config(self):
         """Hot-reload config: merge new backends into existing groups, remove stale ones.
@@ -392,7 +397,8 @@ class MicroLLM:
         new_meta = {}
         for entry in config.get("model_list", []):
             name = entry.get("model_name")
-            if name and ("builtin" in entry or "builtin_system_prompt" in entry or "pdf" in entry):
+            if name and ("builtin" in entry or "system_prompt" in entry
+                         or "builtin_system_prompt" in entry or "pdf" in entry):
                 self._apply_group_meta(name, entry, store=new_meta, flush=True)
 
         # Parse new service backends
@@ -712,6 +718,13 @@ class MicroLLM:
                             data["system"] = system + f"\n\n[Web Search Results]\n{search_text}"
                         else:
                             data["system"] = f"[Web Search Results]\n{search_text}"
+
+        # Group system prompt: injected for all groups that define one,
+        # independent of whether the group also has builtin tools.
+        if "messages" in data:
+            is_anthropic = request.path.endswith("/v1/messages")
+            if self._inject_system_prompt(data, group_meta, is_anthropic):
+                print(f"  {model_name}: system prompt injected", flush=True)
 
         # Builtin tool executor: the alias group runs web_search/web_fetch
         # server-side.  Streaming clients get a streaming-first tool loop
@@ -1604,13 +1617,13 @@ class MicroLLM:
         return bool((message.get("content") or "").strip())
 
     @staticmethod
-    def _inject_builtin_system_prompt(data, group_meta, is_anthropic):
-        """Append the group's builtin_system_prompt to the system context.
+    def _inject_system_prompt(data, group_meta, is_anthropic):
+        """Append the group's system_prompt to the system context.
 
-        Tool descriptions alone are followed unreliably by small models; the
-        same rules in the system position are. Returns True if injected.
+        Works for both tool-loop groups and plain passthrough groups.
+        Returns True if injected.
         """
-        prompt = (group_meta or {}).get("builtin_system_prompt")
+        prompt = (group_meta or {}).get("system_prompt")
         if not prompt:
             return False
         if is_anthropic:
@@ -1675,9 +1688,6 @@ class MicroLLM:
         injected = self._tool_definitions(is_anthropic, builtin_names)
         if injected:
             data["tools"] = list(data.get("tools") or []) + injected
-        if self._inject_builtin_system_prompt(data, group_meta, is_anthropic):
-            print(f"  {model_name}: builtin system prompt injected", flush=True)
-
         client_ip = self._client_ip(request)
         t0 = time.monotonic()
         self.stats[model_name]["requests"] += 1
@@ -1896,9 +1906,6 @@ class MicroLLM:
         injected = self._tool_definitions(is_anthropic, builtin_names)
         if injected:
             data["tools"] = list(data.get("tools") or []) + injected
-        if self._inject_builtin_system_prompt(data, group_meta, is_anthropic):
-            print(f"  {model_name}: builtin system prompt injected", flush=True)
-
         client_ip = self._client_ip(request)
         t0 = time.monotonic()
         self.stats[model_name]["requests"] += 1

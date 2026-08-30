@@ -11,7 +11,7 @@ general_settings:
 model_list:
   - model_name: testgroup
     builtin: [uri_search, uri_fetch]
-    builtin_system_prompt: |
+    system_prompt: |
       BUILTIN-SP-MARKER: Recherche-Regeln (System-Position).
     pdf:
       enabled: true
@@ -27,6 +27,20 @@ model_list:
     alias_of: testgroup
 
   - model_name: plain
+    litellm_params:
+      model: fake-model
+      api_base: http://127.0.0.1:18192/v1
+
+  - model_name: plainprompt
+    system_prompt: |
+      PLAIN-SP-MARKER: Nur System-Prompt, ohne Tools.
+    litellm_params:
+      model: fake-model
+      api_base: http://127.0.0.1:18192/v1
+
+  - model_name: legacyprompt
+    builtin_system_prompt: |
+      LEGACY-SP-MARKER: Alter Key-Name (Backward Compat).
     litellm_params:
       model: fake-model
       api_base: http://127.0.0.1:18192/v1
