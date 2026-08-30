@@ -3061,7 +3061,7 @@ class MicroLLM:
         while True:
             await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
             # Check LLM routes
-            for name, backends in self.routes.items():
+            for name, backends in list(self.routes.items()):
                 for backend in backends:
                     if backend.get("unhealthy_since") is None:
                         continue
