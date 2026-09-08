@@ -548,11 +548,13 @@ class MicroLLM:
             return True
         return (time.monotonic() - us) >= self.HEALTH_COOLDOWN
 
-    def pick_backend(self, model_name):
+    def pick_backend(self, model_name, exclude=None):
         """Pick healthy backend with most free slots (least-connections)."""
         backends = self.routes.get(model_name)
         if not backends:
             return None
+        if exclude:
+            backends = [b for b in backends if b["api_base"] not in exclude]
         best, best_free = None, -1
         for b in backends:
             if not self._is_healthy(b):
@@ -746,11 +748,13 @@ class MicroLLM:
         backends = self.routes[model_name]
         max_tries = len(backends)
         last_error = None
+        failed_ids = set()
 
         for attempt in range(max_tries):
-            route = self.pick_backend(model_name)
+            route = self.pick_backend(model_name, exclude=failed_ids)
             if not route:
                 break
+            failed_ids.add(route["api_base"])
 
             # Prepare request for this backend
             send_data = dict(data)
