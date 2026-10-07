@@ -2906,10 +2906,42 @@ class MicroLLM:
 
     # --- Chatlog ---
 
+    def _extract_session_tag(self, data):
+        """Extract a short session tag from request metadata for chatlog filenames."""
+        try:
+            meta = data.get("metadata", {}) if isinstance(data, dict) else {}
+            user_id = meta.get("user_id", "")
+            if isinstance(user_id, str) and user_id:
+                try:
+                    uid = json.loads(user_id)
+                    sid = uid.get("session_id", "")
+                    if sid:
+                        return sid[:12]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Also check top-level user_id
+            uid_str = data.get("user_id", "") if isinstance(data, dict) else ""
+            if isinstance(uid_str, str) and uid_str:
+                try:
+                    uid = json.loads(uid_str)
+                    sid = uid.get("session_id", "")
+                    if sid:
+                        return sid[:12]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        except Exception:
+            pass
+        return ""
+
     def _chatlog_write(self, seq, kind, data, model_name):
         """Write a request or response to chatlog."""
         try:
-            path = os.path.join(self.chatlog_dir, f"{seq:04d}_{kind}.json")
+            ts = time.strftime("%H%M%S")
+            sess = self._extract_session_tag(data)
+            if sess:
+                path = os.path.join(self.chatlog_dir, f"{ts}_{sess}_{seq:04d}_{kind}.json")
+            else:
+                path = os.path.join(self.chatlog_dir, f"{ts}_{seq:04d}_{kind}.json")
             with open(path, "w") as f:
                 json.dump({"model": model_name, "time": time.strftime("%H:%M:%S"), "data": data}, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -2956,7 +2988,8 @@ class MicroLLM:
                     tb["input"] = None  # PARSE FAILED
                 del tb["input_json"]
 
-            path = os.path.join(self.chatlog_dir, f"{seq:04d}_resp_stream.json")
+            ts = time.strftime("%H%M%S")
+            path = os.path.join(self.chatlog_dir, f"{ts}_{seq:04d}_resp_stream.json")
             with open(path, "w") as f:
                 json.dump({
                     "model": model_name,
