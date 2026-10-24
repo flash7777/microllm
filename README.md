@@ -89,7 +89,8 @@ cd ~/microllm && ./start
 ```yaml
 general_settings:
   ocr_url: http://localhost:8019      # DeepSeek-OCR-2 Service
-  chatlog_dir: /tmp/microllm-chatlog
+  chatlog_dir: /tmp/microllm-chatlog  # Mitschrift aller Anfragen/Antworten, tageweise Unterordner JJJJ-MM-TT
+  chatlog_keep_days: 7                # ältere Tagesordner werden beim Tageswechsel gelöscht (0 = nie)
 
 model_list:
   - model_name: local                  # Alias für Clients
@@ -169,3 +170,15 @@ Wenn ein Request `type: "document"` Blöcke enthält (PDFs):
 ```bash
 podman logs -f microllm
 ```
+
+### Chatlog
+
+Mit `chatlog_dir` schreibt microllm jede Anfrage und Antwort als JSON nach
+`<chatlog_dir>/<JJJJ-MM-TT>/<HHMMSS>_<seq>_<art>.json`. Beim ersten Eintrag
+eines Tages (und nach Start oder Reload) werden Tagesordner gelöscht, die älter
+als `chatlog_keep_days` sind (Default 7: heute und die 6 Tage davor). Dateien
+direkt im `chatlog_dir` (Format vor den Tagesordnern) bleiben unberührt.
+
+Die Mitschriften enthalten vollständige Prompts, also auch Dokumentinhalte und
+Namen. Im Container gehört `chatlog_dir` auf ein Volume, nie in die
+Container-Schicht (Root-Partition).

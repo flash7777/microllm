@@ -22,6 +22,7 @@ Usage:  python3 tests/test_toolloop.py
 """
 import asyncio
 import base64
+import datetime
 import json
 import os
 import shutil
@@ -357,7 +358,7 @@ async def t1_openai_tool_loop(sess):
         check("T1 r3 final-answer nudge present",
               any("antworte jetzt" in str(m.get("content", "")) for m in r3_user_msgs),
               [str(m.get("content", ""))[:60] for m in r3_user_msgs])
-    files = os.listdir(CHATLOG) if os.path.isdir(CHATLOG) else []
+    files = [f for _, _, names in os.walk(CHATLOG) for f in names]
     check("T1 chatlog round files",
           any("req_r1" in f for f in files) and any("req_r3" in f for f in files), files[:10])
 
@@ -842,11 +843,30 @@ async def t15_system_prompt(sess):
         check("T15E legacy key still works", ok, str(msgs)[:200])
 
 
+async def t16_chatlog_retention(sess):
+    print("T16: chatlog daily folders + retention")
+    today = datetime.date.today().isoformat()
+    old_day = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+    kept_day = (datetime.date.today() - datetime.timedelta(days=6)).isoformat()
+    check("T16 today folder has files", bool(os.listdir(os.path.join(CHATLOG, today))))
+    check("T16 day older than 7 days deleted", not os.path.exists(os.path.join(CHATLOG, old_day)))
+    check("T16 day within 7 days kept", os.path.isdir(os.path.join(CHATLOG, kept_day)))
+    check("T16 non-day file untouched", os.path.exists(os.path.join(CHATLOG, "legacy_0001_req.json")))
+
+
 # ---------- main ----------
 
 async def main():
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(CHATLOG, exist_ok=True)
+    # Chatlog-Aufbewahrung (Default 7 Tage): alter Tag weg, junger Tag und
+    # fremde Dateien bleiben (geprüft in t16_chatlog_retention)
+    old_day = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+    kept_day = (datetime.date.today() - datetime.timedelta(days=6)).isoformat()
+    for day in (old_day, kept_day):
+        os.makedirs(os.path.join(CHATLOG, day), exist_ok=True)
+        open(os.path.join(CHATLOG, day, "000000_0001_req.json"), "w").write("{}")
+    open(os.path.join(CHATLOG, "legacy_0001_req.json"), "w").write("{}")
 
     runners = []
     for app, port in ((make_vllm_app(), 18192), (make_searxng_app(), 18191),
@@ -895,6 +915,7 @@ async def main():
             await t13_pdf_fetch_anthropic(sess)
             await t14_pdf_units()
             await t15_system_prompt(sess)
+            await t16_chatlog_retention(sess)
     finally:
         proc.terminate()
         try:

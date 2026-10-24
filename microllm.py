@@ -8,10 +8,12 @@ Drop-in replacement for LiteLLM with compatible YAML config.
 
 import asyncio
 import base64
+import datetime
 import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import sys
@@ -116,6 +118,10 @@ class MicroLLM:
         self.session = None
         self.chatlog_dir = None
         self.chatlog_seq = 0
+        # Chatlog tageweise (<chatlog_dir>/<JJJJ-MM-TT>/…), ältere Tage als
+        # chatlog_keep_days werden beim Tageswechsel gelöscht (0 = nie)
+        self.chatlog_keep_days = 7
+        self._chatlog_day = None
         self.load_config(config_path)
 
     def get_backend_semaphore(self, api_base, max_concurrent=None):
@@ -174,9 +180,11 @@ class MicroLLM:
             print(f"microllm: web fetch service at {self.web_fetch_url}")
 
         self.chatlog_dir = settings.get("chatlog_dir", None)
+        self.chatlog_keep_days = int(settings.get("chatlog_keep_days", 7))
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
-            print(f"microllm: chatlog -> {self.chatlog_dir}")
+            print(f"microllm: chatlog -> {self.chatlog_dir} (keep {self.chatlog_keep_days} days)")
+            self._chatlog_day = None  # nächster Write legt den Tagesordner an und räumt auf
 
         # Tool-Definitionen pro Instanz (general_settings.builtin_tool_defs)
         self._apply_builtin_tool_defs(settings)
@@ -350,8 +358,10 @@ class MicroLLM:
         if self.web_fetch_url:
             self.web_fetch_url = self.web_fetch_url.rstrip("/")
         self.chatlog_dir = settings.get("chatlog_dir", None)
+        self.chatlog_keep_days = int(settings.get("chatlog_keep_days", 7))
         if self.chatlog_dir:
             os.makedirs(self.chatlog_dir, exist_ok=True)
+            self._chatlog_day = None
 
         # Tool-Definitionen pro Instanz (general_settings.builtin_tool_defs)
         self._apply_builtin_tool_defs(settings)
@@ -2933,15 +2943,53 @@ class MicroLLM:
             pass
         return ""
 
+    _CHATLOG_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+    def _chatlog_path(self, name):
+        """Pfad im Tagesordner <chatlog_dir>/<JJJJ-MM-TT>/; beim Tageswechsel
+        (und nach Start/Reload) Ordner anlegen und alte Tage löschen."""
+        day = time.strftime("%Y-%m-%d")
+        day_dir = os.path.join(self.chatlog_dir, day)
+        if day != self._chatlog_day:
+            os.makedirs(day_dir, exist_ok=True)
+            self._chatlog_day = day
+            self._chatlog_prune(day)
+        return os.path.join(day_dir, name)
+
+    def _chatlog_prune(self, today):
+        """Löscht Tagesordner, die älter als chatlog_keep_days sind (heute
+        zählt mit: keep 7 = heute und die 6 Tage davor). Nur Ordner im
+        Format JJJJ-MM-TT, andere Dateien im chatlog_dir bleiben unberührt."""
+        if not self.chatlog_keep_days or self.chatlog_keep_days < 1:
+            return
+        cutoff = (datetime.date.fromisoformat(today)
+                  - datetime.timedelta(days=self.chatlog_keep_days - 1)).isoformat()
+        try:
+            entries = os.listdir(self.chatlog_dir)
+        except OSError as e:
+            print(f"  chatlog prune error: {e}", flush=True)
+            return
+        for entry in sorted(entries):
+            if not self._CHATLOG_DAY_RE.match(entry) or entry >= cutoff:
+                continue
+            path = os.path.join(self.chatlog_dir, entry)
+            if not os.path.isdir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+                print(f"microllm: chatlog {entry} gelöscht (älter als {self.chatlog_keep_days} Tage)", flush=True)
+            except OSError as e:
+                print(f"  chatlog prune error {entry}: {e}", flush=True)
+
     def _chatlog_write(self, seq, kind, data, model_name):
         """Write a request or response to chatlog."""
         try:
             ts = time.strftime("%H%M%S")
             sess = self._extract_session_tag(data)
             if sess:
-                path = os.path.join(self.chatlog_dir, f"{ts}_{sess}_{seq:04d}_{kind}.json")
+                path = self._chatlog_path(f"{ts}_{sess}_{seq:04d}_{kind}.json")
             else:
-                path = os.path.join(self.chatlog_dir, f"{ts}_{seq:04d}_{kind}.json")
+                path = self._chatlog_path(f"{ts}_{seq:04d}_{kind}.json")
             with open(path, "w") as f:
                 json.dump({"model": model_name, "time": time.strftime("%H:%M:%S"), "data": data}, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -2989,7 +3037,7 @@ class MicroLLM:
                 del tb["input_json"]
 
             ts = time.strftime("%H%M%S")
-            path = os.path.join(self.chatlog_dir, f"{ts}_{seq:04d}_resp_stream.json")
+            path = self._chatlog_path(f"{ts}_{seq:04d}_resp_stream.json")
             with open(path, "w") as f:
                 json.dump({
                     "model": model_name,
