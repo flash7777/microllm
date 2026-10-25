@@ -44,3 +44,25 @@ model_list:
     litellm_params:
       model: fake-model
       api_base: http://127.0.0.1:18192/v1
+
+  # TensorFold-Backends (fake tensorfold 18196/18197, /health meldet max_batch_size 3)
+  - model_name: tfgroup
+    priority: background
+    litellm_params:
+      model: tensorfold/tf-model
+      api_base: http://127.0.0.1:18196/v1
+
+  - model_name: tfchat
+    litellm_params:
+      model: tensorfold/tf-model
+      api_base: http://127.0.0.1:18196/v1
+
+  - model_name: tfpair
+    litellm_params:
+      model: tensorfold/tf-model
+      api_base: http://127.0.0.1:18196/v1
+  - model_name: tfpair
+    litellm_params:
+      model: tf-model
+      backend: tensorfold
+      api_base: http://127.0.0.1:18197/v1

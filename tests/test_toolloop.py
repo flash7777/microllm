@@ -242,6 +242,42 @@ def make_vllm_app():
     return app
 
 
+TF_LOG = os.path.join(WORK, "tensorfold_requests.jsonl")
+TF_LANES = 3
+
+
+def make_tensorfold_app(backend_tag):
+    """Fake TensorFold: /health with max_batch_size, 503 for user text TF-FULL on backend A."""
+    app = web.Application()
+
+    async def health(_):
+        return web.json_response({"status": "ok", "model": "tf-model", "max_batch_size": TF_LANES})
+
+    async def models(_):
+        return web.json_response({"data": [{"id": "tf-model"}]})
+
+    async def chat(request):
+        body = await request.json()
+        with open(TF_LOG, "a") as f:
+            f.write(json.dumps({"backend": backend_tag, "body": body}, ensure_ascii=False) + "\n")
+        if backend_tag == "A" and _user_says(body.get("messages", []), "TF-FULL"):
+            return web.json_response({"error": {"message": "no lane free", "type": "server_error"}}, status=503)
+        answer = openai_final(body.get("model", "tf-model"))
+        answer["choices"][0]["message"]["content"] = f"TF-{backend_tag}"
+        return web.json_response(answer)
+
+    app.router.add_get("/health", health)
+    app.router.add_get("/v1/models", models)
+    app.router.add_post("/v1/chat/completions", chat)
+    return app
+
+
+def read_tf_log(marker):
+    if not os.path.exists(TF_LOG):
+        return []
+    return [json.loads(line) for line in open(TF_LOG) if marker in line]
+
+
 def make_searxng_app():
     app = web.Application()
 
@@ -856,6 +892,43 @@ async def t16_chatlog_retention(sess):
 
 # ---------- main ----------
 
+async def t17_tensorfold(sess):
+    print("T17: tensorfold backend type (priority, lanes from /health, 503 failover)")
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "tfgroup", "messages": [{"role": "user", "content": "Hallo MK-T17-BG"}]})
+    entries = read_tf_log("MK-T17-BG")
+    check("T17 status 200", status == 200, text[:200])
+    check("T17 backend model name without prefix", entries and entries[0]["body"].get("model") == "tf-model",
+          entries[:1])
+    check("T17 group priority background set", entries and entries[0]["body"].get("priority") == "background",
+          entries[:1])
+
+    await post(sess, "/v1/chat/completions", {
+        "model": "tfchat", "messages": [{"role": "user", "content": "Hallo MK-T17-FG"}]})
+    entries = read_tf_log("MK-T17-FG")
+    check("T17 no priority without group setting", entries and "priority" not in entries[0]["body"], entries[:1])
+
+    await post(sess, "/v1/chat/completions", {
+        "model": "plain", "priority": "background",
+        "messages": [{"role": "user", "content": "Hallo MK-T17-VLLM"}]})
+    entries = find_marker("MK-T17-VLLM", "/v1/chat/completions")
+    check("T17 string priority stripped for vLLM", entries and "priority" not in entries[0]["body"], entries[:1])
+
+    status, _ct, text = await post(sess, "/v1/chat/completions", {
+        "model": "tfpair", "messages": [{"role": "user", "content": "TF-FULL MK-T17-FULL"}]})
+    answer = json.loads(text).get("choices", [{}])[0].get("message", {}).get("content") if status == 200 else ""
+    check("T17 503 -> other backend answers", status == 200 and answer == "TF-B", f"{status} {text[:200]}")
+
+    async with sess.get(MICROLLM + "/stats") as resp:
+        stats = await resp.json()
+    tf_backends = stats["models"]["tfgroup"]["backends"]
+    check("T17 kind tensorfold in /stats", tf_backends and tf_backends[0].get("kind") == "tensorfold", tf_backends)
+    check("T17 max_concurrent from /health lanes",
+          tf_backends and tf_backends[0].get("queue", {}).get("max") == TF_LANES, tf_backends)
+    pair_backends = stats["models"]["tfpair"]["backends"]
+    check("T17 503 not counted as failure", all(b["fail_count"] == 0 for b in pair_backends), pair_backends)
+
+
 async def main():
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(CHATLOG, exist_ok=True)
@@ -870,7 +943,8 @@ async def main():
 
     runners = []
     for app, port in ((make_vllm_app(), 18192), (make_searxng_app(), 18191),
-                      (make_taki_app(), 18190), (make_webfetch_app(), 18193)):
+                      (make_taki_app(), 18190), (make_webfetch_app(), 18193),
+                      (make_tensorfold_app("A"), 18196), (make_tensorfold_app("B"), 18197)):
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", port)
@@ -916,6 +990,7 @@ async def main():
             await t14_pdf_units()
             await t15_system_prompt(sess)
             await t16_chatlog_retention(sess)
+            await t17_tensorfold(sess)
     finally:
         proc.terminate()
         try:

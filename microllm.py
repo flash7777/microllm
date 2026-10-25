@@ -209,8 +209,10 @@ class MicroLLM:
                 "api_base": api_base,
                 "model": model,
                 "api_key": api_key,
+                "kind": self._backend_kind(raw_model, params),
                 "max_model_len": int(params.get("max_model_len", 0)),
                 "max_concurrent": int(params.get("max_concurrent", 0)),  # 0 = use global default
+                "max_concurrent_auto": int(params.get("max_concurrent", 0)) == 0,
             }
             if "chat_template_kwargs" in params:
                 route["chat_template_kwargs"] = params["chat_template_kwargs"]
@@ -289,24 +291,36 @@ class MicroLLM:
                         print(f"    - {b['api_base']}")
 
     @staticmethod
+    def _backend_kind(raw_model, params):
+        """Backend-Typ: litellm_params.backend oder Präfix "tensorfold/<name>", sonst openai (vLLM & Co.)."""
+        kind = params.get("backend")
+        if kind:
+            return str(kind).lower()
+        if raw_model.startswith("tensorfold/"):
+            return "tensorfold"
+        return "openai"
+
+    @staticmethod
     def _default_pdf_meta():
         return {"enabled": True, "images": False, "vision": False, "vector": False, "dpi": 100, "max_image_pages": 8}
 
     @staticmethod
     def _default_group_meta():
-        return {"builtin": [], "system_prompt": None, "pdf": MicroLLM._default_pdf_meta()}
+        return {"builtin": [], "system_prompt": None, "pdf": MicroLLM._default_pdf_meta(), "priority": None}
 
     @staticmethod
     def _inherit_group_meta(inherited):
         return {"builtin": list(inherited.get("builtin") or []),
                 "system_prompt": inherited.get("system_prompt"),
-                "pdf": dict(inherited.get("pdf") or MicroLLM._default_pdf_meta())}
+                "pdf": dict(inherited.get("pdf") or MicroLLM._default_pdf_meta()),
+                "priority": inherited.get("priority")}
+
+    GROUP_META_KEYS = ("builtin", "system_prompt", "builtin_system_prompt", "pdf", "priority")
 
     def _apply_group_meta(self, name, entry, store=None, flush=False):
-        """Merge builtin/system_prompt/pdf keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
+        """Merge builtin/system_prompt/pdf/priority keys of a model_list entry into the group meta store (pro Alias-Gruppe)."""
         store = store if store is not None else self.route_meta
-        if "builtin" not in entry and "system_prompt" not in entry \
-                and "builtin_system_prompt" not in entry and "pdf" not in entry:
+        if not any(key in entry for key in self.GROUP_META_KEYS):
             return
         if name not in store or store[name] is None:
             store[name] = self._default_group_meta()
@@ -327,12 +341,21 @@ class MicroLLM:
                 meta["system_prompt"] = prompt
         if "pdf" in entry:
             meta["pdf"].update(entry["pdf"])
+        if "priority" in entry:
+            # TensorFold-Priorität für die ganze Gruppe; nur "background" (Batch-Läufe) oder leer
+            group_priority = entry["priority"] or None
+            if group_priority not in (None, "background"):
+                print(f"  ! {name}: priority must be 'background' or empty, ignored", flush=flush)
+            else:
+                meta["priority"] = group_priority
         parts = []
         if meta["builtin"]:
             parts.append(f"builtin={meta['builtin']}")
         if meta.get("system_prompt"):
             parts.append("system_prompt")
         parts.append(f"pdf={meta['pdf']}")
+        if meta.get("priority"):
+            parts.append(f"priority={meta['priority']}")
         print(f"  {name:20s} {'  '.join(parts)}", flush=flush)
 
     def reload_config(self):
@@ -395,8 +418,10 @@ class MicroLLM:
             api_key = params.get("api_key", "dummy")
             route = {
                 "api_base": api_base, "model": model, "api_key": api_key,
+                "kind": self._backend_kind(raw_model, params),
                 "max_model_len": int(params.get("max_model_len", 0)),
                 "max_concurrent": int(params.get("max_concurrent", 0)),
+                "max_concurrent_auto": int(params.get("max_concurrent", 0)) == 0,
                 "unhealthy_since": None, "fail_count": 0,
             }
             if "chat_template_kwargs" in params:
@@ -407,8 +432,7 @@ class MicroLLM:
         new_meta = {}
         for entry in config.get("model_list", []):
             name = entry.get("model_name")
-            if name and ("builtin" in entry or "system_prompt" in entry
-                         or "builtin_system_prompt" in entry or "pdf" in entry):
+            if name and any(key in entry for key in self.GROUP_META_KEYS):
                 self._apply_group_meta(name, entry, store=new_meta, flush=True)
 
         # Parse new service backends
@@ -583,6 +607,26 @@ class MicroLLM:
         start = self.rr_index[model_name] % n
         self.rr_index[model_name] = start + 1
         return backends[start]
+
+    def _backend_body(self, data, route, model_name):
+        """Request body for one backend: backend model name, chat_template_kwargs, TensorFold priority."""
+        body = dict(data)
+        body["model"] = route["model"]
+        if "chat_template_kwargs" in route and "chat_template_kwargs" not in body:
+            body["chat_template_kwargs"] = route["chat_template_kwargs"]
+        if route.get("kind") == "tensorfold":
+            group_priority = (self.route_meta.get(model_name) or {}).get("priority")
+            if group_priority and "priority" not in body:
+                body["priority"] = group_priority
+        elif isinstance(body.get("priority"), str):
+            # "background" ist TensorFold-Vokabular; vLLM erwartet eine Zahl und antwortet sonst 400
+            del body["priority"]
+        return body
+
+    @staticmethod
+    def _tensorfold_full(route, status):
+        """TensorFold refuses admission with 503 when its lanes/KV pool are taken: busy, not broken."""
+        return route.get("kind") == "tensorfold" and status == 503
 
     def mark_failed(self, model_name, backend):
         """Mark a backend as failed. After threshold, set unhealthy timestamp."""
@@ -767,10 +811,7 @@ class MicroLLM:
             failed_ids.add(route["api_base"])
 
             # Prepare request for this backend
-            send_data = dict(data)
-            send_data["model"] = route["model"]
-            if "chat_template_kwargs" in route and "chat_template_kwargs" not in send_data:
-                send_data["chat_template_kwargs"] = route["chat_template_kwargs"]
+            send_data = self._backend_body(data, route, model_name)
 
             body_out = json.dumps(send_data).encode()
 
@@ -795,6 +836,11 @@ class MicroLLM:
                 sem = self.get_backend_semaphore(route["api_base"], route.get("max_concurrent") or None)
                 async with sem:
                     async with self.session.post(url, data=body_out, headers=headers) as resp:
+                        if self._tensorfold_full(route, resp.status) and attempt + 1 < max_tries:
+                            last_error = f"HTTP 503 from {route['api_base']}: {(await resp.text())[:200]}"
+                            print(f"  {model_name}: {route['api_base']} full (503), "
+                                  f"trying next ({attempt+1}/{max_tries})", flush=True)
+                            continue
                         content_type = resp.headers.get("content-type", "")
                         self.mark_success(model_name, route)
 
@@ -1251,7 +1297,8 @@ class MicroLLM:
                 s["avg_tok_s"] = 0
             backend_list = []
             for b in backends:
-                entry = {"api_base": b["api_base"], "healthy": self._is_healthy(b), "fail_count": b["fail_count"],
+                entry = {"api_base": b["api_base"], "kind": b.get("kind", "openai"),
+                         "healthy": self._is_healthy(b), "fail_count": b["fail_count"],
                          "unhealthy_since": b.get("unhealthy_since")}
                 sem = self.backend_semaphores.get(b["api_base"])
                 if sem is not None:
@@ -2172,10 +2219,7 @@ class MicroLLM:
         route = self.pick_backend(model_name)
         if not route:
             return None
-        prep = dict(send_data)
-        prep["model"] = route["model"]
-        if "chat_template_kwargs" in route and "chat_template_kwargs" not in prep:
-            prep["chat_template_kwargs"] = route["chat_template_kwargs"]
+        prep = self._backend_body(send_data, route, model_name)
         body_out = json.dumps(prep).encode()
         url = f"{route['api_base']}{request.path}"
         qs = request.query_string
@@ -2506,10 +2550,7 @@ class MicroLLM:
             route = self.pick_backend(model_name)
             if not route:
                 break
-            s = dict(send_data)
-            s["model"] = route["model"]
-            if "chat_template_kwargs" in route and "chat_template_kwargs" not in s:
-                s["chat_template_kwargs"] = route["chat_template_kwargs"]
+            s = self._backend_body(send_data, route, model_name)
             body_out = json.dumps(s).encode()
             url = f"{route['api_base']}{request.path}"
             qs = request.query_string
@@ -2526,7 +2567,8 @@ class MicroLLM:
                     async with self.session.post(url, data=body_out, headers=headers) as resp:
                         if resp.status >= 400:
                             body = await resp.text()
-                            self.mark_failed(model_name, route)
+                            if not self._tensorfold_full(route, resp.status):
+                                self.mark_failed(model_name, route)
                             last_error = f"HTTP {resp.status} from {route['api_base']}: {body[:200]}"
                             print(f"  {model_name}: {last_error}, "
                                   f"trying next ({attempt+1}/{len(backends)})", flush=True)
@@ -3119,11 +3161,13 @@ class MicroLLM:
         new_aliases = {}
         for base, info in base_info.items():
             api_key = "dummy"
-            # Find api_key from any backend using this base
+            backend_kind = "openai"
+            # Find api_key (and backend kind) from any backend using this base
             for backends in self.routes.values():
                 for b in backends:
                     if b["api_base"] == base:
                         api_key = b["api_key"]
+                        backend_kind = b.get("kind", "openai")
                         break
             for m in info.get("models", []):
                 mid = m.get("id", "")
@@ -3132,6 +3176,7 @@ class MicroLLM:
                         "api_base": base,
                         "model": mid,
                         "api_key": api_key,
+                        "kind": backend_kind,
                         "max_model_len": m.get("max_model_len", 0),
                         "unhealthy_since": None,
                         "fail_count": 0,
@@ -3139,7 +3184,44 @@ class MicroLLM:
                     print(f"  + alias: {mid}", flush=True)
 
         self.routes.update(new_aliases)
+        await self._discover_tensorfold_lanes()
         print(flush=True)
+
+    async def _discover_tensorfold_lanes(self):
+        """TensorFold: max_concurrent 0 (auto) = lanes from GET /health max_batch_size, semaphore to match."""
+        lanes_by_base = {}
+        for backends in self.routes.values():
+            for backend in backends:
+                base = backend["api_base"]
+                if backend.get("kind") != "tensorfold" or base in lanes_by_base:
+                    continue
+                lanes_by_base[base] = 0
+                try:
+                    async with self.session.get(f"{base}/health", timeout=ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            health = await resp.json(content_type=None)
+                            lanes_by_base[base] = int(health.get("max_batch_size") or 0)
+                except Exception as e:
+                    print(f"  {base}: tensorfold /health {type(e).__name__} - {e}", flush=True)
+
+        for base, lanes in lanes_by_base.items():
+            if lanes <= 0:
+                continue
+            auto_backends = [b for backends in self.routes.values() for b in backends
+                             if b["api_base"] == base and b.get("max_concurrent_auto")]
+            if not auto_backends:
+                continue
+            old_limit = auto_backends[0].get("max_concurrent") or self.MAX_CONCURRENT_PER_BACKEND
+            if old_limit == lanes:
+                continue
+            sem = self.backend_semaphores.get(base)
+            if sem is not None and sem._value != old_limit:
+                print(f"  {base}: tensorfold {lanes} lanes, requests in flight, keeping {old_limit} for now", flush=True)
+                continue
+            for backend in auto_backends:
+                backend["max_concurrent"] = lanes
+            self.backend_semaphores[base] = asyncio.Semaphore(lanes)
+            print(f"  {base}: tensorfold {lanes} lanes -> max_concurrent {lanes}", flush=True)
 
     async def _health_check_loop(self):
         """Periodically probe unhealthy backends whose cooldown has elapsed."""
