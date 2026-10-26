@@ -173,6 +173,9 @@ class MicroLLM:
         if self.web_search_url:
             self.web_search_url = self.web_search_url.rstrip("/")
             print(f"microllm: web search at {self.web_search_url}")
+        self.web_search_engines = self._parse_engine_list(settings.get("web_search_engines", None))
+        if self.web_search_engines:
+            print(f"microllm: web search engines {self.web_search_engines}")
 
         self.web_fetch_url = settings.get("web_fetch_url", None)
         if self.web_fetch_url:
@@ -377,6 +380,7 @@ class MicroLLM:
         self.web_search_url = settings.get("web_search_url", None)
         if self.web_search_url:
             self.web_search_url = self.web_search_url.rstrip("/")
+        self.web_search_engines = self._parse_engine_list(settings.get("web_search_engines", None))
         self.web_fetch_url = settings.get("web_fetch_url", None)
         if self.web_fetch_url:
             self.web_fetch_url = self.web_fetch_url.rstrip("/")
@@ -1552,11 +1556,23 @@ class MicroLLM:
             print(f"  WebSearch error: {e}", flush=True)
             return [{"title": "Search error", "url": "", "snippet": str(e)}]
 
+    @staticmethod
+    def _parse_engine_list(engines):
+        """web_search_engines: YAML-Liste oder kommagetrennter String -> 'a,b,c' oder None."""
+        if not engines:
+            return None
+        if isinstance(engines, str):
+            engines = engines.split(",")
+        engine_names = [str(name).strip() for name in engines if str(name).strip()]
+        return ",".join(engine_names) or None
+
     async def _search_searxng(self, query, max_results):
         """Search via SearXNG JSON API."""
-        # brandis: google/duckduckgo sind von der Pod-Egress-IP gebannt (CSE-Rate-Limit, CAPTCHA/403).
-        # qwant+mojeek liefern relevante deutsche Ergebnisse; bing/startpage/brave als Reserve.
-        params = f"?q={query}&format=json&engines=qwant,mojeek,brave&max_results={max_results}"
+        # Engine-Auswahl: general_settings.web_search_engines (Hot-Reload). Ohne Eintrag
+        # entscheidet die settings.yml von SearXNG (disabled: true/false).
+        params = f"?q={query}&format=json&max_results={max_results}"
+        if self.web_search_engines:
+            params += f"&engines={self.web_search_engines}"
         url = f"{self.web_search_url}/search{params}"
         async with self.session.get(url, timeout=ClientTimeout(total=15)) as resp:
             if resp.status == 200:

@@ -5,6 +5,8 @@
 general_settings:
   chatlog_dir: /tmp/microllm-chatlog
   web_search_url: duckduckgo
+  # SearXNG-Engines fuer web_search (Liste oder "a,b"), Hot-Reload. Ohne Eintrag entscheidet SearXNG.
+  # web_search_engines: [mojeek, qwant]
   web_fetch_url: http://10.89.1.1:8899   # open_fetch service (bot-safe uri_fetch)
 
   # Tool-Definitionen (ueberschreiben Defaults aus microllm.py)
